@@ -16,6 +16,7 @@ import (
 type Event struct {
 	Seq      int64           `json:"seq"`
 	ByDevice string          `json:"byDevice"`
+	Room     string          `json:"room,omitempty"` // 房间根设备 ID：只投递给同房间设备
 	Event    json.RawMessage `json:"event"`
 }
 
@@ -40,13 +41,13 @@ func (rb *RingBuffer) Append(e *Event) {
 	}
 }
 
-// Replay 返回 seq > since 的全部缓冲事件（可能为空：缺口已超出窗口）
-func (rb *RingBuffer) Replay(since int64) []*Event {
+// Replay 返回 seq > since 且属于指定房间（room 为空表示不区分房间）的全部缓冲事件
+func (rb *RingBuffer) Replay(since int64, room string) []*Event {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	var out []*Event
 	for _, e := range rb.events {
-		if e.Seq > since {
+		if e.Seq > since && (room == "" || e.Room == "" || e.Room == room) {
 			out = append(out, e)
 		}
 	}
@@ -158,9 +159,14 @@ func (h *Hub) broadcast(e *Event, except *conn) {
 	h.mu.Lock()
 	targets := make([]*conn, 0, len(h.conns))
 	for c := range h.conns {
-		if c != except {
-			targets = append(targets, c)
+		// 房间隔离：只投递给同房间设备（老数据 Room 为空时退化为全局广播）
+		if c == except {
+			continue
 		}
+		if e.Room != "" && c.device != nil && c.device.RoomID != "" && c.device.RoomID != e.Room {
+			continue
+		}
+		targets = append(targets, c)
 	}
 	h.mu.Unlock()
 	for _, c := range targets {
@@ -174,7 +180,7 @@ func (h *Hub) broadcast(e *Event, except *conn) {
 func (h *Hub) publish(device *Device, raw json.RawMessage) *Event {
 	h.mu.Lock()
 	h.seq++
-	e := &Event{Seq: h.seq, ByDevice: device.ID, Event: raw}
+	e := &Event{Seq: h.seq, ByDevice: device.ID, Room: device.RoomID, Event: raw}
 	h.rb.Append(e)
 	h.mu.Unlock()
 	return e
@@ -243,9 +249,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer s.hub.drop(c)
 	go writeLoop(c)
 
-	// 重连补发：先 hello.ok（告知缺口条数），再按序回放 seq > lastSeq
+	// 重连补发：先 hello.ok（告知缺口条数），再按序回放 seq > lastSeq（仅同房间）
 	// （含自己发布的，客户端按 byDevice==self 跳过）
-	replay := s.hub.rb.Replay(hello.LastSeq)
+	replay := s.hub.rb.Replay(hello.LastSeq, device.RoomID)
 	c.enqueueJSON(map[string]any{"v": 1, "type": "hello.ok", "seq": s.hub.LatestSeq(), "replayed": len(replay)})
 	for _, e := range replay {
 		b, _ := json.Marshal(map[string]any{"v": 1, "type": "event", "seq": e.Seq, "byDevice": e.ByDevice, "event": e.Event})

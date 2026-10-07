@@ -50,7 +50,7 @@ func wsURL(httpURL string) string {
 
 func joinDevice(t *testing.T, s *Server, name string) *Device {
 	t.Helper()
-	d, err := s.devices.Create(name, "admin")
+	d, err := s.devices.Create(name, "admin", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +344,8 @@ func TestDevicePeersListAndRevoke(t *testing.T) {
 	}
 }
 
-func TestRingBufferEviction(t *testing.T) {	cfg := loadConfig()
+func TestRingBufferEviction(t *testing.T) {
+	cfg := loadConfig()
 	cfg.BufferEvents = 3
 	rb := NewRingBuffer(cfg)
 	for i := int64(1); i <= 5; i++ {
@@ -354,13 +355,65 @@ func TestRingBufferEviction(t *testing.T) {	cfg := loadConfig()
 	if rb.LatestSeq() != 5 {
 		t.Fatalf("LatestSeq 应为 5")
 	}
-	if got := len(rb.Replay(0)); got != 3 {
+	if got := len(rb.Replay(0, "")); got != 3 {
 		t.Fatalf("缓冲应只保留 3 条，得到 %d", got)
 	}
-	if got := rb.Replay(2); len(got) != 3 || got[0].Seq != 3 {
+	if got := rb.Replay(2, ""); len(got) != 3 || got[0].Seq != 3 {
 		t.Fatalf("Replay(2) 应返回 3、4、5")
 	}
-	if got := rb.Replay(5); len(got) != 0 {
+	if got := rb.Replay(5, ""); len(got) != 0 {
 		t.Fatalf("无缺口时 Replay 应为空")
+	}
+}
+
+// TestRoomIsolation 开放注册各自成新房间；同房间互相收到事件，跨房间收不到。
+func TestRoomIsolation(t *testing.T) {
+	s, ts := newTestServer(t)
+	// register 路由开放时：两次注册是两个独立房间
+	devA, err := s.devices.Create("pc-A", "register", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	devB, err := s.devices.Create("pc-B", "register", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A2 与 A 同房间（模拟 A 生成配对码、对方加入后归入 A 的房间）
+	devA2, err := s.devices.Create("pc-A2", "invite", devA.RoomID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if devA.RoomID == devB.RoomID {
+		t.Fatalf("两次注册应产生不同房间: %s", devA.RoomID)
+	}
+
+	wsA, chA := dial(t, ts, devA.Token, 0)
+	defer wsA.Close()
+	waitFrame(t, chA, 2*time.Second, "hello.ok")
+	wsA2, chA2 := dial(t, ts, devA2.Token, 0)
+	defer wsA2.Close()
+	waitFrame(t, chA2, 2*time.Second, "hello.ok")
+	wsB, chB := dial(t, ts, devB.Token, 0)
+	defer wsB.Close()
+	waitFrame(t, chB, 2*time.Second, "hello.ok")
+
+	// A 发布 → 同房间的 A2 收到，跨房间的 B 收不到
+	wsA.WriteJSON(map[string]any{
+		"v": 1, "type": "publish", "clientEventId": "e1",
+		"events": []map[string]any{{
+			"kind": "clip.add", "syncId": "s1", "clipType": 1,
+			"hash": 42, "payloadB64": "aGVsbG8=", "ts": 1728283021123,
+		}},
+	})
+	waitFrame(t, chA, 2*time.Second, "publish.ok")
+	ev := waitFrame(t, chA2, 2*time.Second, "event")
+	if ev["byDevice"] != devA.ID {
+		t.Fatalf("A2 应收到 A 的事件，得到 %v", ev)
+	}
+	select {
+	case b := <-chB:
+		t.Fatalf("跨房间设备不应收到事件，却收到: %s", b)
+	case <-time.After(800 * time.Millisecond):
+		// 符合预期：隔离生效
 	}
 }

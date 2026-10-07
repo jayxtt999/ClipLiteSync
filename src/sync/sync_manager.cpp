@@ -100,7 +100,16 @@ void SyncManager::connectionLoop() {
     int backoffSeconds = 1;
     while (running_.load()) {
         setState(SyncState::Connecting);
-        if (connectAndSession() && sendHelloAndConsumeAck()) {
+        SetLastError(0);
+        const bool connected = connectAndSession();
+        bool sessionOk = false;
+        if (!connected) {
+            log(("connect: connectAndSession failed, GLE=" +
+                 std::to_string(GetLastError())).c_str());
+        } else if (!(sessionOk = sendHelloAndConsumeAck())) {
+            log("connect: sendHelloAndConsumeAck failed");
+        }
+        if (connected && sessionOk) {
             backoffSeconds = 1;
             setState(SyncState::Online);
             // 读循环：收到帧交给 handleServerFrame；服务端静默/断开则退出重连
@@ -179,6 +188,8 @@ bool SyncManager::parseUrl(const std::wstring& url, std::wstring& host, int& por
     secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
     path.assign(parts.lpszUrlPath && parts.dwUrlPathLength ? parts.lpszUrlPath : L"/");
     if (path.empty() || path[0] != L'/') path = L"/" + path;
+    // 服务器地址未写路径时默认连 /ws（如 ws://192.168.1.10:8765）
+    if (path == L"/") path = L"/ws";
     return true;
 }
 
@@ -186,34 +197,51 @@ bool SyncManager::connectAndSession() {
     std::wstring host, path;
     int port = 0;
     bool secure = false;
-    if (!parseUrl(config_.serverUrl, host, port, secure, path)) return false;
+    if (!parseUrl(config_.serverUrl, host, port, secure, path)) {
+        log("connect: parseUrl failed");
+        return false;
+    }
 
     session_ = WinHttpOpen(L"ClipLite-Sync/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                            WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session_) return false;
+    if (!session_) {
+        log(("connect: WinHttpOpen failed GLE=" + std::to_string(GetLastError())).c_str());
+        return false;
+    }
     WinHttpSetTimeouts(static_cast<HINTERNET>(session_), kConnectTimeoutMs, kConnectTimeoutMs,
                        kConnectTimeoutMs, kReceiveTimeoutMs);
 
     connection_ = WinHttpConnect(static_cast<HINTERNET>(session_), host.c_str(),
                                  static_cast<INTERNET_PORT>(port), 0);
-    if (!connection_) return false;
+    if (!connection_) {
+        log(("connect: WinHttpConnect failed GLE=" + std::to_string(GetLastError())).c_str());
+        return false;
+    }
 
     DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
     request_ = WinHttpOpenRequest(static_cast<HINTERNET>(connection_), L"GET", path.c_str(),
                                   nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!request_) return false;
+    if (!request_) {
+        log(("connect: WinHttpOpenRequest failed GLE=" + std::to_string(GetLastError())).c_str());
+        return false;
+    }
 
     // WebSocket 升级：该选项为"空标记"型——必须传 (nullptr, 0)，传 BOOL 缓冲会报 87；
     // 设置后 Connection/Upgrade/Sec-WebSocket-* 头由 WinHTTP 自动生成，应用只带业务头。
     if (!WinHttpSetOption(static_cast<HINTERNET>(request_), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET,
                           nullptr, 0)) {
+        log(("connect: set upgrade option failed GLE=" + std::to_string(GetLastError())).c_str());
         return false;
     }
 
     std::wstring tokenHeader = L"Authorization: Bearer " + config_.deviceToken + L"\r\n";
     if (!WinHttpSendRequest(static_cast<HINTERNET>(request_), tokenHeader.c_str(), -1,
-                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(static_cast<HINTERNET>(request_), nullptr)) {
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+        log(("connect: WinHttpSendRequest failed GLE=" + std::to_string(GetLastError())).c_str());
+        return false;
+    }
+    if (!WinHttpReceiveResponse(static_cast<HINTERNET>(request_), nullptr)) {
+        log(("connect: WinHttpReceiveResponse failed GLE=" + std::to_string(GetLastError())).c_str());
         return false;
     }
 
@@ -221,9 +249,16 @@ bool SyncManager::connectAndSession() {
     WinHttpQueryHeaders(static_cast<HINTERNET>(request_),
                         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                         WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
-    if (status != HTTP_STATUS_SWITCH_PROTOCOLS && status != 200) return false;
+    if (status != HTTP_STATUS_SWITCH_PROTOCOLS && status != 200) {
+        log(("connect: unexpected status " + std::to_string(status)).c_str());
+        return false;
+    }
 
     socket_ = WinHttpWebSocketCompleteUpgrade(static_cast<HINTERNET>(request_), 0);
+    if (!socket_) {
+        log(("connect: WebSocketCompleteUpgrade failed GLE=" +
+             std::to_string(GetLastError())).c_str());
+    }
     return socket_ != nullptr;
 }
 
@@ -574,6 +609,34 @@ bool SyncManager::DeviceInvite(const std::wstring& serverUrl, const std::string&
     code = json.at("code").asString();
     expiresAtMs = json.at("expiresAt").asInt();
     if (code.empty()) {
+        errorUtf8 = "服务端响应缺少字段";
+        return false;
+    }
+    return true;
+}
+
+bool SyncManager::DeviceRegister(const std::wstring& serverUrl, const std::string& deviceName,
+                                 std::string& deviceId, std::string& deviceToken,
+                                 std::string& errorUtf8) {
+    const std::string body = "{\"deviceName\":\"" + jsonEscape(deviceName) + "\"}";
+    int status = 0;
+    std::string response;
+    if (!restCall(serverUrl, L"POST", L"/v1/device/register", body, {},
+                  status, response, errorUtf8)) {
+        return false;
+    }
+    JValue json;
+    if (!parseJson(response, json) || !json.isObject()) {
+        errorUtf8 = "服务端响应解析失败";
+        return false;
+    }
+    if (status != 200) {
+        errorUtf8 = errorFromResponse(status, response);
+        return false;
+    }
+    deviceId = json.at("deviceId").asString();
+    deviceToken = json.at("deviceToken").asString();
+    if (deviceId.empty() || deviceToken.empty()) {
         errorUtf8 = "服务端响应缺少字段";
         return false;
     }

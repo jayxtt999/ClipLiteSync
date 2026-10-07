@@ -17,26 +17,28 @@ import (
 // ---------- 配置 ----------
 
 type Config struct {
-	Port           string
-	DataDir        string
-	AdminPassword  string
-	MaxMsgBytes    int64 // 单条 WS 消息上限
-	BufferEvents   int   // 环形缓冲条数上限
-	BufferBytes    int64 // 环形缓冲总字节上限
-	BundleMaxBytes int64 // 文件清单打包上限（协议 §4.7）
-	InviteTTL      time.Duration
+	Port            string
+	DataDir         string
+	AdminPassword   string
+	MaxMsgBytes     int64 // 单条 WS 消息上限
+	BufferEvents    int   // 环形缓冲条数上限
+	BufferBytes     int64 // 环形缓冲总字节上限
+	BundleMaxBytes  int64 // 文件清单打包上限（协议 §4.7）
+	InviteTTL       time.Duration
+	DisableRegister bool // CLIPSYNC_DISABLE_REGISTER=1 时关闭开放注册
 }
 
 func loadConfig() Config {
 	c := Config{
-		Port:           envOr("CLIPSYNC_PORT", "8765"),
-		DataDir:        envOr("CLIPSYNC_DATA_DIR", "./data"),
-		AdminPassword:  os.Getenv("CLIPSYNC_ADMIN_PASSWORD"),
-		MaxMsgBytes:    int64(envOrInt("CLIPSYNC_MAX_MSG_MB", 64)) << 20,
-		BufferEvents:   envOrInt("CLIPSYNC_BUFFER_EVENTS", 200),
-		BufferBytes:    int64(envOrInt("CLIPSYNC_BUFFER_BYTES_MB", 256)) << 20,
-		BundleMaxBytes: int64(envOrInt("CLIPSYNC_BUNDLE_MAX_MB", 20)) << 20,
-		InviteTTL:      10 * time.Minute,
+		Port:            envOr("CLIPSYNC_PORT", "8765"),
+		DataDir:         envOr("CLIPSYNC_DATA_DIR", "./data"),
+		AdminPassword:   os.Getenv("CLIPSYNC_ADMIN_PASSWORD"),
+		MaxMsgBytes:     int64(envOrInt("CLIPSYNC_MAX_MSG_MB", 64)) << 20,
+		BufferEvents:    envOrInt("CLIPSYNC_BUFFER_EVENTS", 200),
+		BufferBytes:     int64(envOrInt("CLIPSYNC_BUFFER_BYTES_MB", 256)) << 20,
+		BundleMaxBytes:  int64(envOrInt("CLIPSYNC_BUNDLE_MAX_MB", 20)) << 20,
+		InviteTTL:       10 * time.Minute,
+		DisableRegister: os.Getenv("CLIPSYNC_DISABLE_REGISTER") == "1",
 	}
 	if c.AdminPassword == "" {
 		// 安全基线：不再提供默认密码。未设置时管理接口不可用（也无"创始码"，
@@ -71,9 +73,54 @@ type Device struct {
 	Token     string `json:"token"`
 	CreatedAt int64  `json:"createdAt"`
 	Revoked   bool   `json:"revoked"`
-	// CreatedBy 记录该设备由谁引入：邀请设备的 ID 或 "admin"（创始码）。
+	// CreatedBy 记录该设备由谁引入：邀请设备的 ID、"admin"（创始码）或 "register"（开放注册）。
 	// 房主只能列表/踢出自己引入的设备。
 	CreatedBy string `json:"createdBy,omitempty"`
+	// RoomID 房间标识 = 房间根设备（首台设备）的 ID。同一房间的设备才能收到彼此的同步事件。
+	RoomID string `json:"roomId,omitempty"`
+}
+
+// NormalizeRooms 迁移：为没有 RoomID 的设备按 CreatedBy 树计算房间归属。
+// 规则：admin 创始码引导的设备归房间 "admin"；无 createdBy 的老数据与 register
+// 注册的设备自成一个房间；其余设备沿 CreatedBy 向上追溯到房间根。返回是否有变更。
+func (ds *DeviceStore) NormalizeRooms() bool {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	changed := false
+	byID := map[string]*Device{}
+	for _, d := range ds.Devices {
+		byID[d.ID] = d
+	}
+	var root func(d *Device) string
+	root = func(d *Device) string {
+		switch d.CreatedBy {
+		case "admin":
+			return "admin"
+		case "", "register":
+			return d.ID
+		}
+		parent := byID[d.CreatedBy]
+		if parent == nil || parent.Revoked {
+			return d.ID // 引入人已吊销/不存在：独立成房间，不并入其他房间
+		}
+		return root(parent)
+	}
+	for _, d := range ds.Devices {
+		want := root(d)
+		if d.Revoked {
+			want = d.RoomID // 已吊销设备不再参与广播，保留原值即可
+		}
+		if d.RoomID != want {
+			d.RoomID = want
+			changed = true
+		}
+	}
+	if changed {
+		if err := ds.saveLocked(); err != nil {
+			log.Printf("[warn] 保存房间迁移结果失败: %v", err)
+		}
+	}
+	return changed
 }
 
 type DeviceStore struct {
@@ -107,13 +154,22 @@ func (ds *DeviceStore) saveLocked() error {
 	return os.Rename(tmp, ds.path)
 }
 
-func (ds *DeviceStore) Create(name, createdBy string) (*Device, error) {
+// Create 创建设备。rootID 传入其所在房间的根设备 ID；传空时按 createdBy 推导：
+// admin 创始码引导的设备同属房间 "admin"，register 注册的设备自成一个新房间，其余自成房间。
+func (ds *DeviceStore) Create(name, createdBy, rootID string) (*Device, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	id, _ := randomToken(8)
 	tok, _ := randomToken(32)
+	if rootID == "" {
+		if createdBy == "admin" {
+			rootID = "admin"
+		} else {
+			rootID = "dev-" + id
+		}
+	}
 	d := &Device{ID: "dev-" + id, Name: name, Token: tok, CreatedAt: time.Now().UnixMilli(),
-		CreatedBy: createdBy}
+		CreatedBy: createdBy, RoomID: rootID}
 	ds.Devices = append(ds.Devices, d)
 	return d, ds.saveLocked()
 }
@@ -306,6 +362,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
+	if devices.NormalizeRooms() {
+		log.Println("[migrate] 设备房间归属已按引入关系计算并写回 devices.json")
+	}
 	hub := NewHub(cfg)
 
 	srv := &Server{cfg: cfg, devices: devices, invites: NewInviteStore(), pending: NewPendingStore(),
@@ -319,6 +378,7 @@ func main() {
 	mux.HandleFunc("/v1/admin/devices/", srv.handleAdminRevoke)
 	mux.HandleFunc("/v1/device/invite", srv.handleDeviceInvite)
 	mux.HandleFunc("/v1/device/join", srv.handleDeviceJoin)
+	mux.HandleFunc("/v1/device/register", srv.handleDeviceRegister)
 	mux.HandleFunc("/v1/device/join/status", srv.handleJoinStatus)
 	mux.HandleFunc("/v1/device/pending", srv.handleDevicePending)
 	mux.HandleFunc("/v1/device/pending/decide", srv.handlePendingDecide)

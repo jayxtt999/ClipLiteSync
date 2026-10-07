@@ -31,6 +31,7 @@ $env:CLIPSYNC_DATA_DIR = "./data"
 | `CLIPSYNC_BUFFER_EVENTS` | 200 | 重连补发缓冲条数 |
 | `CLIPSYNC_BUFFER_BYTES_MB` | 256 | 补发缓冲总字节上限 |
 | `CLIPSYNC_BUNDLE_MAX_MB` | 20 | 文件清单打包上传上限（协议 §4.7） |
+| `CLIPSYNC_DISABLE_REGISTER` | （关闭） | 设为 1 时关闭开放注册（POST /v1/device/register），公网部署建议关闭 |
 
 ## 部署形态
 

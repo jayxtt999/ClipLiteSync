@@ -638,6 +638,9 @@ struct AppState {
     bool syncPairPhaseRequested = false; // true=提交申请待确认（区别于直接配对成功）
     bool syncGenBusy = false;            // 房主：配对码生成中
     std::chrono::steady_clock::time_point syncGenStartAt{}; // 生成开始时间（卡死保护）
+    bool syncGenRegistered = false;      // 本次生成前执行了开放注册（结果含新 token）
+    std::string syncGenRegDeviceId;
+    std::string syncGenRegToken;
     std::string syncGenCode;             // 房主：最近生成的配对码
     std::string syncGenError;
     std::string syncJoinRequestId;       // 加入方：待确认申请 ID（空=无）
@@ -1599,8 +1602,9 @@ void refreshSyncStatusControl(HWND hwnd) {
             }
             if (probe == 1) {
                 text = languageIsChinese()
-                    ? L"未配对 · 服务器连接正常，填入配对码后点「加入」"
-                    : L"Not paired · server reachable, enter a pair code and click Join";
+                    ? L"未配对 · 服务器连接正常：填码点「加入」入组，或点「生成配对码」创建新房间"
+                    : L"Not paired · server reachable: enter a code and Join, or click "
+                      L"\"Generate pair code\" to create a new room";
             } else if (probe == 2) {
                 text = languageIsChinese()
                     ? L"未配对 · 无法连接服务器，请检查地址与网络"
@@ -1794,10 +1798,12 @@ void handleSyncPairResult(HWND hwnd) {
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
-// 生成配对码（房主，后台线程）
+// 生成配对码（房主，后台线程）。未配对但已填服务器地址时，先开放注册本机
+// （自成一个新房间，无需管理员创始码），再生成配对码。
 void handleSyncGenCodeClicked(HWND hwnd) {
     if (!g_app || !hwnd) return;
     std::string token;
+    std::string server;
     {
         std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
         if (g_app->syncGenBusy) {
@@ -1813,37 +1819,73 @@ void handleSyncGenCodeClicked(HWND hwnd) {
             g_app->syncGenBusy = false;
         }
         token = g_app->settingsData.syncToken;
+        server = g_app->settingsData.syncServer;
     }
-    if (token.empty()) {
+    if (token.empty() && server.empty()) {
         setSettingsActionFeedback(hwnd,
-            tr(L"This device has not joined a sync room yet, so it cannot generate pair "
-               L"codes. Join first: enter a pair code above, or use the admin bootstrap "
-               L"code on the server.",
-               L"本机还没有加入任何同步房间，无法生成配对码。请先用上方「加入其他设备」"
-               L"填码加入，或在服务端用管理员创始码完成首次配对。"), false);
+            tr(L"Enter the server address above (e.g. ws://192.168.1.10:8765) first. "
+               L"Clicking \"Generate pair code\" will then register this device and "
+               L"create a new room automatically.",
+               L"请先在上方填写服务器地址，例如 ws://192.168.1.10:8765。填好后点"
+               L"「生成配对码」，本机会自动在服务端注册并创建一个新房间。"), false);
         InvalidateRect(hwnd, nullptr, FALSE);
         return;
     }
-    const std::string server = g_app->settingsData.syncServer;
+    wchar_t computerName[MAX_COMPUTERNAME_LENGTH + 1]{};
+    DWORD nameLength = ARRAYSIZE(computerName);
+    if (!GetComputerNameW(computerName, &nameLength) || nameLength == 0) {
+        wcscpy_s(computerName, L"Windows-PC");
+        nameLength = static_cast<DWORD>(wcslen(computerName));
+    }
+    const std::string deviceName = wideToUtf8(computerName, nameLength);
     {
         std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
         g_app->syncGenBusy = true;
         g_app->syncGenStartAt = std::chrono::steady_clock::now();
+        g_app->syncGenRegistered = false;
+        g_app->syncGenRegDeviceId.clear();
+        g_app->syncGenRegToken.clear();
     }
     if (HWND box = settingsControl(hwnd, kSettingSyncCodeBox)) {
         SetWindowTextW(box, tr(L"...", L"..."));
     }
     setSettingsActionFeedback(hwnd,
-        tr(L"Generating pair code…", L"正在生成配对码…"), true);
+        token.empty()
+            ? tr(L"Registering this device on the server and creating a new room…",
+                 L"正在向服务端注册本机并创建新房间…")
+            : tr(L"Generating pair code…", L"正在生成配对码…"), true);
     const HWND settingsWindow = hwnd;
-    std::thread([settingsWindow, server, token] {
+    std::thread([settingsWindow, server, token, deviceName] {
+        using clipsync::SyncManager;
+        std::string activeToken = token;
+        std::string deviceId;
+        std::string newToken;
         std::string code;
         std::int64_t expiresAt = 0;
         std::string error;
-        const bool ok = clipsync::SyncManager::DeviceInvite(utf8ToWide(server), token,
-                                                            code, expiresAt, error);
+        bool registered = false;
+        bool ok = false;
+        if (activeToken.empty()) {
+            // 开放注册：本机成为新房间的第一台设备
+            registered = SyncManager::DeviceRegister(utf8ToWide(server), deviceName,
+                                                     deviceId, newToken, error);
+            if (registered) {
+                activeToken = newToken;
+                ok = SyncManager::DeviceInvite(utf8ToWide(server), activeToken,
+                                               code, expiresAt, error);
+                if (!ok && !newToken.empty()) {
+                    // 注册成功但生成码失败：token 仍保留，下次点击直接生成
+                }
+            }
+        } else {
+            ok = SyncManager::DeviceInvite(utf8ToWide(server), activeToken,
+                                           code, expiresAt, error);
+        }
         if (g_app) {
             std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+            g_app->syncGenRegistered = registered;
+            g_app->syncGenRegDeviceId = registered ? deviceId : std::string();
+            g_app->syncGenRegToken = registered ? newToken : std::string();
             g_app->syncGenCode = ok ? code : std::string();
             g_app->syncGenError = ok ? std::string() : error;
             g_app->syncGenBusy = false;
@@ -1856,13 +1898,30 @@ void handleSyncGenCodeClicked(HWND hwnd) {
 void handleSyncGenCodeResult(HWND hwnd) {
     if (!g_app || !hwnd) return;
     bool ok = false;
+    bool registered = false;
     std::string code;
     std::string error;
+    std::string regDeviceId;
+    std::string regToken;
     {
         std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
         ok = !g_app->syncGenCode.empty();
+        registered = g_app->syncGenRegistered;
         code = g_app->syncGenCode;
         error = g_app->syncGenError;
+        regDeviceId = g_app->syncGenRegDeviceId;
+        regToken = g_app->syncGenRegToken;
+    }
+    if (registered && ok && !regToken.empty()) {
+        // 开放注册成功：持久化本机在服务端的新身份（新房间的第一台设备）
+        g_app->settingsData.syncToken = regToken;
+        g_app->settingsData.syncDeviceId = regDeviceId;
+        g_app->settingsData.syncEnabled = true;
+        saveSettings(g_app->settingsData);
+        if (HWND toggle = settingsControl(hwnd, kSettingSyncEnabled)) {
+            setSettingsToggleValue(toggle, true);
+        }
+        applySyncSettings();
     }
     if (HWND box = settingsControl(hwnd, kSettingSyncCodeBox)) {
         SetWindowTextW(box, ok ? utf8ToWide(code).c_str()
@@ -1870,12 +1929,17 @@ void handleSyncGenCodeResult(HWND hwnd) {
     }
     if (ok) {
         setSettingsActionFeedback(hwnd,
-            tr(L"Pair code generated. Valid for 10 minutes, one-time use.",
-               L"配对码已生成：10 分钟内有效，一次性使用。"), true);
+            registered
+                ? tr(L"This device is registered as a new room. Pair code generated, "
+                     L"valid for 10 minutes, one-time use.",
+                     L"本机已注册为新房间，配对码已生成：10 分钟内有效，一次性使用。")
+                : tr(L"Pair code generated. Valid for 10 minutes, one-time use.",
+                     L"配对码已生成：10 分钟内有效，一次性使用。"), true);
     } else {
         setSettingsActionFeedback(hwnd,
             tr(L"Generate pair code failed: ", L"生成配对码失败：") + utf8ToWide(error), false);
     }
+    refreshSyncStatusControl(hwnd);
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
@@ -8120,8 +8184,11 @@ SettingsLayout buildSettingsLayout(HWND hwnd) {
             rows.push_back(makeSettingsRow(
                 hwnd,
                 tr(L"Codes are valid for 10 minutes, single use. Requests appear in the "
-                   L"list below for you to approve or reject.",
-                   L"配对码 10 分钟内有效、一次性使用。对方填码申请后会出现在下方待确认列表，由你决定允许或拒绝。"),
+                   L"list below for you to approve or reject. If this device is not "
+                   L"paired yet, clicking the button registers it on the server and "
+                   L"creates a new room automatically.",
+                   L"配对码 10 分钟内有效、一次性使用。对方填码申请后会出现在下方待确认列表，由你决定允许或拒绝。"
+                   L"本机尚未配对时，点此按钮会自动在服务端注册并创建一个新房间。"),
                 {}, {}, {}, contentWidth));
             makeCard(tr(L"Invite devices", L"邀请设备加入"), std::move(rows));
         }
@@ -11751,8 +11818,9 @@ void setSettingsActionFeedback(HWND hwnd, const std::wstring& message, bool succ
     g_app->settingsActionFeedback = message;
     g_app->settingsActionFeedbackSuccess = success;
     if (g_app->settingsTab == kSettingsSyncPage) {
-        // 同步页反馈画在标题下方的固定条带（内容区内），回滚到页顶避免被滚动内容盖住
-        g_app->settingsScrollOffset = 0;
+        // 同步页反馈画在标题下方的固定条带（内容区内），回滚到页顶避免被滚动内容盖住。
+        // 必须走 setSettingsScrollPosition：直接改变量不会移动内容子窗口，滚动条不动。
+        setSettingsScrollPosition(hwnd, 0);
     }
     if (success) {
         SetTimer(hwnd, kSettingsActionFeedbackTimer, kSettingsActionFeedbackMs, nullptr);

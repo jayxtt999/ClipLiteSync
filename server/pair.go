@@ -42,12 +42,12 @@ func randomCode(n int) string {
 type PendingJoin struct {
 	RequestID string    `json:"requestId"`
 	Code      string    `json:"code"`
-	Device    string    `json:"device"`   // 生成码的设备 ID
-	Name      string    `json:"name"`     // 申请设备名
+	Device    string    `json:"device"` // 生成码的设备 ID
+	Name      string    `json:"name"`   // 申请设备名
 	CreatedAt time.Time `json:"createdAt"`
 	Status    string    `json:"status"` // pending / approved / rejected
 	// approve 后填充，供申请方轮询领取
-	DeviceID   string `json:"deviceId,omitempty"`
+	DeviceID    string `json:"deviceId,omitempty"`
 	DeviceToken string `json:"deviceToken,omitempty"`
 }
 
@@ -127,7 +127,7 @@ type ipState struct {
 }
 
 type JoinGuard struct {
-	mu sync.Mutex
+	mu  sync.Mutex
 	ips map[string]*ipState
 }
 
@@ -250,7 +250,7 @@ func (s *Server) handleDeviceJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	// 创始码（管理员生成）：无确认人，直接建号
 	if inv.CreatedBy == "admin" {
-		d, err := s.devices.Create(req.DeviceName, "admin")
+		d, err := s.devices.Create(req.DeviceName, "admin", "")
 		if err != nil {
 			respond(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -286,6 +286,50 @@ func (s *Server) handleJoinStatus(w http.ResponseWriter, r *http.Request) {
 	default:
 		respond(w, 200, map[string]string{"status": "pending"})
 	}
+}
+
+// POST /v1/device/register —— 开放注册：设备自行创建新房间（无需管理员创始码）
+// 可用环境变量 CLIPSYNC_DISABLE_REGISTER=1 关闭（如公网部署时）。
+func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respond(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.cfg.DisableRegister {
+		respond(w, 403, map[string]string{"error": "服务端已关闭开放注册，请联系管理员用创始码配对"})
+		return
+	}
+	var req struct {
+		DeviceName string `json:"deviceName"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.joinGuard.Allow(r, false)
+		respond(w, 400, map[string]string{"error": "请求格式错误"})
+		return
+	}
+	// 与 join 同样的限速：每分钟 5 次/IP
+	if allowed, code := s.joinGuard.Allow(r, true); !allowed {
+		if code == "locked" {
+			respond(w, 429, map[string]string{"error": "失败次数过多，请 15 分钟后再试"})
+		} else {
+			respond(w, 429, map[string]string{"error": "请求过于频繁，每分钟最多 5 次"})
+		}
+		return
+	}
+	name := strings.TrimSpace(req.DeviceName)
+	if name == "" {
+		name = "未命名设备"
+	}
+	if len(name) > 64 {
+		name = name[:64]
+	}
+	d, err := s.devices.Create(name, "register", "")
+	if err != nil {
+		respond(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	log.Printf("[pair] 开放注册：设备 %s(%s) 创建新房间 %s", d.Name, d.ID, d.RoomID)
+	respond(w, 200, map[string]string{"status": "registered", "deviceId": d.ID, "deviceToken": d.Token})
 }
 
 // GET /v1/device/pending —— 房主拉取待确认申请
@@ -342,8 +386,8 @@ func (s *Server) handlePendingDecide(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]string{"ok": "rejected"})
 		return
 	}
-	// 记录引入关系：房主可在此后列表/踢出该设备
-	d, err := s.devices.Create(p.Name, device.ID)
+	// 记录引入关系：房主可在此后列表/踢出该设备；新设备归入房主所在房间
+	d, err := s.devices.Create(p.Name, device.ID, device.RoomID)
 	if err != nil {
 		respond(w, 500, map[string]string{"error": err.Error()})
 		return

@@ -107,6 +107,12 @@ public:
     static bool DeviceInvite(const std::wstring& serverUrl, const std::string& deviceToken,
                              std::string& code, std::int64_t& expiresAtMs, std::string& errorUtf8);
 
+    // 开放注册：本机未配对时直接向服务端注册，自成一个新房间（无需管理员创始码）。
+    // 成功返回 true 并填 deviceId/deviceToken；服务端可用 CLIPSYNC_DISABLE_REGISTER=1 关闭。
+    static bool DeviceRegister(const std::wstring& serverUrl, const std::string& deviceName,
+                               std::string& deviceId, std::string& deviceToken,
+                               std::string& errorUtf8);
+
     // 新设备提交加入申请。返回 true 表示请求本身成功（按 phase 区分）：
     // Approved = 创始码直接配对成功（deviceId/deviceToken 有效）；
     // Requested = 已提交，等待房主确认（requestId 有效）。

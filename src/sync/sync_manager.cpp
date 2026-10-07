@@ -69,11 +69,15 @@ void SyncManager::Stop() {
 
 bool SyncManager::Publish(const SyncEvent& event) {
     if (!running_.load()) return false;
-    if (static_cast<int>(event.payload.size()) > config_.maxPayloadBytes) return false;
+    const std::uint64_t totalBytes =
+        static_cast<std::uint64_t>(event.payload.size()) + event.bundleZip.size();
+    if (totalBytes > static_cast<std::uint64_t>(config_.maxPayloadBytes)) return false;
+    SyncEvent out = event;
+    if (out.syncId.empty()) out.syncId = makeSyncId(); // 幂等键兜底（接收端依赖它去重）
     {
         std::lock_guard<std::mutex> lock(outboxMutex_);
         if (outbox_.size() >= kOutboxLimit) outbox_.pop_front(); // 极端背压下丢最旧
-        outbox_.push_back(event);
+        outbox_.push_back(std::move(out));
     }
     outboxCv_.notify_one();
     return true;
@@ -373,7 +377,16 @@ void SyncManager::applyRemoteEvent(const std::string& byDevice, const std::strin
         e.ts = static_cast<std::uint64_t>(ev.at("ts").asInt());
         if (!e.localOnly) {
             const std::string b64 = ev.at("payloadB64").asString();
-            if (!base64Decode(b64, e.payload)) return;
+            if (!b64.empty() && !base64Decode(b64, e.payload)) return;
+            if (ev.has("bundle")) {
+                const JValue& bundle = ev.at("bundle");
+                if (!bundle.isObject()) return;
+                e.bundleFileCount = static_cast<int>(bundle.at("fileCount").asInt(0));
+                e.bundleTotalBytes =
+                    static_cast<std::uint64_t>(bundle.at("totalBytes").asInt(0));
+                const std::string bundleB64 = bundle.at("payloadB64").asString();
+                if (bundleB64.empty() || !base64Decode(bundleB64, e.bundleZip)) return;
+            }
         }
         if (remoteHandler_) remoteHandler_(e); // 宿主负责 hash 查重 + ClipStore 注入
     } else if (e.kind == "clip.delete" || e.kind == "clip.pin") {
@@ -424,7 +437,14 @@ std::string SyncManager::buildEventJson(const SyncEvent& e) {
            << ",\"localOnly\":" << (e.localOnly ? "true" : "false")
            << ",\"sourceApp\":\"" << jsonEscape(e.sourceApp) << "\",\"ts\":" << e.ts;
         if (!e.localOnly) {
-            os << ",\"payloadB64\":\"" << base64Encode(e.payload) << "\"";
+            if (!e.bundleZip.empty()) {
+                // 文件清单打包：bundle 携带 zip，payloadB64 省略（清单文本由接收端解压后重建）
+                os << ",\"bundle\":{\"fileCount\":" << e.bundleFileCount
+                   << ",\"totalBytes\":" << e.bundleTotalBytes
+                   << ",\"payloadB64\":\"" << base64Encode(e.bundleZip) << "\"}";
+            } else {
+                os << ",\"payloadB64\":\"" << base64Encode(e.payload) << "\"";
+            }
         }
     } else if (e.kind == "clip.pin") {
         os << ",\"hash\":" << e.hash << ",\"pinned\":" << (e.pinned ? "true" : "false");

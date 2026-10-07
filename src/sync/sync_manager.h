@@ -38,6 +38,11 @@ struct SyncEvent {
     int clipType = 1;       // 与 ClipLite ClipType 对应：1 Text, 2 Files, 3 Image, 4 ImageV5, 5 Html
     std::uint64_t hash = 0; // 内容哈希（clipLiteHash）
     std::string payload;    // 原始字节（内部做 base64）
+    // 文件清单打包（clipType=2 且未超限时；协议 §3.3 bundle）。
+    // 发送端填 zip 原始字节；接收端收到的也是解 base64 后的 zip 原始字节。
+    std::string bundleZip;
+    int bundleFileCount = 0;
+    std::uint64_t bundleTotalBytes = 0;
     bool localOnly = false; // true=仅本机标记（如超限文件清单）
     bool pinned = false;    // kind=clip.pin 时的置顶状态
     std::string sourceApp;

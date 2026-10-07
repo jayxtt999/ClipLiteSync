@@ -84,9 +84,11 @@
 4. **幂等**：`publish.ok` 按 `clientEventId` 匹配；补发重复投递靠 `syncId`/`seq` 去重，无副作用。
 5. **last_seq 持久化**：随 settings 落盘（`sync.lastSeq`），断电重启后可用于补发。
 6. **重连**：指数退避（1s、2s、4s…上限 60s）；重连后 `hello.lastSeq` 触发服务端补发；若 `hello.ok.seq - lastSeq > 缓冲窗口`，客户端静默接受缺口（本地日志记一条 WARN）。
-7. **文件列表规则**：`clipType=2` 时统计清单内文件总大小：
-   - 总大小 ≤ **20MB**（服务端配置 `bundleMaxBytes`，默认 20971520）→ 打包 zip（含相对路径，条目不落地，粘贴时解压到临时目录）→ `bundle` 携带；
-   - 超限 → `localOnly=true` 仅同步清单文本，远端标记"仅本机"不可粘贴。
+7. **文件列表规则**（一期已实现，`src/sync/zip_util.h` store 模式零依赖编解码）：
+   `clipType=2` 时统计清单内文件总大小：
+   - 总大小 ≤ **20MB**（服务端配置 `CLIPSYNC_BUNDLE_MAX_MB`，默认 20）→ 打包 zip（仅保留文件名，重名加序号）→ `bundle` 携带；接收端解压到本机数据目录 `synced\<syncId>\` 后以落地路径清单入库（"粘贴时解压"留作二期优化）；
+   - 缺失文件/目录/超限 → `localOnly=true` 仅同步清单文本，远端标记"仅本机"不可粘贴。
+   - 已知局限：delete/pin 事件以发送端 hash 匹配条目，文件清单的 hash 基于本地路径，跨设备路径不同时 delete/pin 不生效（文本/图片不受影响）。
 8. **暂停**：设置里可暂停上行 / 下行（托盘菜单同步开关）。
 
 ## 5. REST 接口（管理面，非数据面）

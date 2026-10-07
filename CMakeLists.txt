@@ -65,4 +65,11 @@ if(BUILD_TESTING)
     target_include_directories(ClipLiteSyncJsonTests PRIVATE src)
     target_compile_definitions(ClipLiteSyncJsonTests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     add_test(NAME ClipLiteSyncJson COMMAND ClipLiteSyncJsonTests)
+
+    add_executable(ClipLiteZipTests
+        tests/zip_util_tests.cpp
+    )
+    target_include_directories(ClipLiteZipTests PRIVATE src)
+    target_compile_definitions(ClipLiteZipTests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME ClipLiteZip COMMAND ClipLiteZipTests)
 endif()

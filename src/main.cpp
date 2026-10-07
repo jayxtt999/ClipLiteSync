@@ -17,6 +17,7 @@
 #include "thumbnail_cache.h"
 #include "popup_preview_renderer.h"
 #include "sync/sync_manager.h"
+#include "sync/zip_util.h"
 #include "sync/sync_util.h"
 
 #include <algorithm>
@@ -30,6 +31,8 @@
 #include <cstdlib>
 #include <deque>
 #include <functional>
+#include <map>
+#include <cwctype>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
@@ -686,19 +689,43 @@ void shutdownGdiplusIfIdle() {
     }
 }
 
+// 测试实例后缀：取数据目录末段并清理非法字符，使多个测试实例互不串扰
+std::wstring testInstanceSuffix() {
+    wchar_t testDir[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"CLIPLITE_TEST_DATA_DIR", testDir, ARRAYSIZE(testDir));
+    std::wstring suffix;
+    if (length > 0) {
+        std::wstring dir(testDir, length);
+        while (!dir.empty() && (dir.back() == L'\\' || dir.back() == L'/')) dir.pop_back();
+        const std::size_t slash = dir.find_last_of(L"\\/");
+        const std::wstring base = slash == std::wstring::npos ? dir : dir.substr(slash + 1);
+        for (wchar_t c : base) {
+            suffix.push_back((std::iswalnum(c) || c == L'_') ? c : L'_');
+        }
+    }
+    return suffix;
+}
+
 HANDLE createSingleInstanceMutex() {
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, FALSE};
     const bool securityReady = ConvertStringSecurityDescriptorToSecurityDescriptorW(
         L"D:(A;;GA;;;WD)", SDDL_REVISION_1, &descriptor, nullptr) != FALSE;
     if (securityReady) attributes.lpSecurityDescriptor = descriptor;
-    // 测试实例（CLIPLITE_TEST_DATA_DIR 隔离数据目录）使用独立锁名，可与正式实例并行运行
+    // 测试实例（CLIPLITE_TEST_DATA_DIR 隔离数据目录）使用独立锁名，可与正式实例并行运行；
+    // 锁名带上数据目录后缀，多个测试实例之间也互不干扰
     wchar_t testDir[MAX_PATH]{};
     const bool isTestInstance = GetEnvironmentVariableW(
         L"CLIPLITE_TEST_DATA_DIR", testDir, ARRAYSIZE(testDir)) > 0;
+    static std::wstring mutexName;
+    if (mutexName.empty()) {
+        mutexName = isTestInstance
+            ? L"ClipLite.SingleInstance.Test." + testInstanceSuffix()
+            : std::wstring(L"ClipLite.SingleInstance");
+    }
     HANDLE mutex = CreateMutexW(securityReady ? &attributes : nullptr, TRUE,
-                                isTestInstance ? L"ClipLite.SingleInstance.Test"
-                                               : L"ClipLite.SingleInstance");
+                                mutexName.c_str());
     const DWORD error = GetLastError();
     if (descriptor) LocalFree(descriptor);
     SetLastError(error);
@@ -708,8 +735,15 @@ HANDLE createSingleInstanceMutex() {
 // 测试实例使用独立窗口类名，避免单实例转发/退出消息串扰正式实例
 const wchar_t* hiddenWindowClassName() {
     wchar_t testDir[MAX_PATH]{};
-    return GetEnvironmentVariableW(L"CLIPLITE_TEST_DATA_DIR", testDir, ARRAYSIZE(testDir)) > 0
-        ? L"ClipLiteHidden.Test" : L"ClipLiteHidden";
+    const bool isTestInstance = GetEnvironmentVariableW(
+        L"CLIPLITE_TEST_DATA_DIR", testDir, ARRAYSIZE(testDir)) > 0;
+    static std::wstring className;
+    if (className.empty()) {
+        className = isTestInstance
+            ? L"ClipLiteHidden.Test." + testInstanceSuffix()
+            : std::wstring(L"ClipLiteHidden");
+    }
+    return className.c_str();
 }
 
 struct PopupSearchResult {
@@ -1314,6 +1348,82 @@ void saveSyncLastSeq(std::int64_t value) {
     }
 }
 
+// ---------- 文件清单打包同步（协议 §4.7，clipType=2） ----------
+
+std::wstring utf8ToWide(const std::string& value);
+std::string wideToUtf8(const wchar_t* value, std::size_t length);
+
+// 同步打包上限：与服务端 CLIPSYNC_BUNDLE_MAX_MB 默认值一致
+constexpr std::uint64_t kSyncBundleMaxBytes = 20ull << 20;
+
+// 清单路径 -> zip 条目名：只保留文件名（不透出本地目录结构），重名追加序号
+std::wstring bundleEntryName(const std::wstring& path, std::size_t index) {
+    std::wstring name(path);
+    const std::size_t slash = name.find_last_of(L"/\\");
+    if (slash != std::wstring::npos) name.erase(0, slash + 1);
+    if (name.empty()) name = L"file" + std::to_wstring(index + 1);
+    return name;
+}
+
+// 统计清单内文件并打包为 store 模式 zip。失败（路径缺失/目录/超限）返回 false。
+bool buildFileBundle(const std::string& payload, clipsync::SyncEvent& event) {
+    const std::wstring paths = utf8ToWide(payload);
+    std::vector<std::wstring> files;
+    std::size_t start = 0;
+    while (start <= paths.size()) {
+        const std::size_t end = paths.find(L'\n', start);
+        std::wstring path = paths.substr(start,
+            end == std::wstring::npos ? std::wstring::npos : end - start);
+        if (!path.empty() && path.back() == L'\r') path.pop_back();
+        if (path.empty()) return false;
+        const DWORD attrs = GetFileAttributesW(path.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return false;
+        files.push_back(std::move(path));
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+    }
+    if (files.empty() || files.size() > 4096) return false;
+    std::uint64_t total = 0;
+    std::vector<clipsync::ZipEntry> entries;
+    entries.reserve(files.size());
+    std::map<std::wstring, int> nameCount;
+    for (std::size_t i = 0; i < files.size(); ++i) {
+        WIN32_FILE_ATTRIBUTE_DATA attr{};
+        if (!GetFileAttributesExW(files[i].c_str(), GetFileExInfoStandard, &attr)) return false;
+        const std::uint64_t size =
+            (static_cast<std::uint64_t>(attr.nFileSizeHigh) << 32) | attr.nFileSizeLow;
+        total += size;
+        if (total > kSyncBundleMaxBytes) return false;
+        std::FILE* file = nullptr;
+        if (_wfopen_s(&file, files[i].c_str(), L"rb") != 0 || !file) return false;
+        std::string bytes(static_cast<std::size_t>(size), '\0');
+        const std::size_t read = size == 0 ? 0 : std::fread(bytes.data(), 1, bytes.size(), file);
+        std::fclose(file);
+        if (read != bytes.size()) return false;
+        // 同名冲突：第二次出现起在扩展名前插入 " (n)"
+        std::wstring name = bundleEntryName(files[i], i);
+        const int seen = nameCount[name]++;
+        if (seen > 0) {
+            std::wstring stem = name, ext;
+            const std::size_t dot = name.find_last_of(L'.');
+            if (dot != std::wstring::npos && dot != 0) {
+                stem = name.substr(0, dot);
+                ext = name.substr(dot);
+            }
+            name = stem + L" (" + std::to_wstring(seen + 1) + L")" + ext;
+        }
+        clipsync::ZipEntry entry;
+        entry.name = wideToUtf8(name.c_str(), name.size());
+        entry.data = std::move(bytes);
+        if (entry.name.empty()) return false;
+        entries.push_back(std::move(entry));
+    }
+    if (!clipsync::makeZip(entries, event.bundleZip)) return false;
+    event.bundleFileCount = static_cast<int>(entries.size());
+    event.bundleTotalBytes = total;
+    return true;
+}
+
 // 本机剪贴板入库成功后发布同步事件（在 storage worker 线程调用，SyncManager 内部排队）
 void publishClipAddSync(ClipType type, const std::string& payload, std::uint64_t hash,
                         const std::string& source) {
@@ -1324,9 +1434,9 @@ void publishClipAddSync(ClipType type, const std::string& payload, std::uint64_t
     event.hash = hash;
     event.sourceApp = source;
     event.ts = clipsync::unixNowMs();
-    // 一期：文件清单不同步本体（远端无对应文件），标记仅本机；小文件打包 zip 为后续版本
     if (type == ClipType::Files) {
-        event.localOnly = true;
+        // 小文件打包 zip 同步；缺失/目录/超限则退回"仅本机"标记
+        if (!buildFileBundle(payload, event)) event.localOnly = true;
     } else {
         event.payload = payload;
     }
@@ -1342,6 +1452,40 @@ void publishClipMetaSync(std::size_t index, const char* kind, bool pinned) {
     const auto& items = g_app->store.items();
     if (index >= items.size()) return;
     g_app->sync.PublishMeta(kind, clipsync::makeSyncId(), items[index].hash, pinned);
+}
+
+// 远端文件包解压：解到 数据目录\synced\<syncId>\，返回 '\n' 拼接的落地路径清单。
+// （一期实现为"接收即落地"；协议原文的"粘贴时解压"留作二期优化）
+bool extractFileBundle(const clipsync::SyncEvent& event, std::string& payloadOut) {
+    std::vector<clipsync::ZipEntry> entries;
+    if (!clipsync::readZip(event.bundleZip, entries)) return false;
+    std::wstring dirName;
+    for (char c : event.syncId) {
+        dirName.push_back((std::isalnum(static_cast<unsigned char>(c)) || c == '-') ?
+            static_cast<wchar_t>(c) : L'_');
+    }
+    if (dirName.empty()) return false;
+    const std::wstring targetDir = clipLiteDataDirectory() + L"\\synced\\" + dirName;
+    const DWORD created = SHCreateDirectoryExW(nullptr, targetDir.c_str(), nullptr);
+    if (created != ERROR_SUCCESS && created != ERROR_ALREADY_EXISTS &&
+        created != ERROR_FILE_EXISTS) {
+        return false;
+    }
+    std::wstring payload;
+    for (const clipsync::ZipEntry& entry : entries) {
+        if (entry.name.empty()) return false;
+        const std::wstring target = targetDir + L"\\" + utf8ToWide(entry.name);
+        std::FILE* file = nullptr;
+        if (_wfopen_s(&file, target.c_str(), L"wb") != 0 || !file) return false;
+        const std::size_t written = entry.data.empty() ? 0 :
+            std::fwrite(entry.data.data(), 1, entry.data.size(), file);
+        std::fclose(file);
+        if (written != entry.data.size()) return false;
+        if (!payload.empty()) payload.push_back(L'\n');
+        payload += target;
+    }
+    payloadOut = wideToUtf8(payload.c_str(), payload.size());
+    return !payloadOut.empty();
 }
 
 std::wstring themesPath() {
@@ -13889,13 +14033,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
         appendDiagnosticLog("INFO", "sync: remote event received");
         enqueueStorageJob([event] {
             if (event.kind == "clip.add") {
-                // 文件清单条目仅本机（远端无文件本体），跳过
-                if (event.localOnly || event.payload.empty()) return;
-                const ClipType type = static_cast<ClipType>(event.clipType);
-                const std::uint64_t hash = clipboardDedupHash(type, event.payload);
+                if (event.localOnly) return; // 超限大文件清单：仅本机，跳过
+                ClipType type = static_cast<ClipType>(event.clipType);
+                std::string payload = event.payload;
+                if (!event.bundleZip.empty()) {
+                    // 文件清单打包：解压到 synced 目录后以本地路径清单入库
+                    if (!extractFileBundle(event, payload)) {
+                        appendDiagnosticLog("ERROR", "sync: file bundle extract failed");
+                        return;
+                    }
+                    type = ClipType::Files;
+                    appendDiagnosticLog("INFO", "sync: file bundle extracted");
+                }
+                if (payload.empty()) return;
+                const std::uint64_t hash = clipboardDedupHash(type, payload);
                 appendDiagnosticLog("INFO", "sync: clip.add hash computed");
                 if (g_app->store.findHash(hash) != g_app->store.activeCount()) return; // 已存在，去重
-                if (g_app->store.appendOrUpdate(type, event.payload, hash, "clip-sync")) {
+                if (g_app->store.appendOrUpdate(type, payload, hash, "clip-sync")) {
                     appendDiagnosticLog("INFO", "sync: remote clip appended");
                     PostMessageW(g_app->hidden, kStoreChangedMessage, 0, 0);
                 } else {

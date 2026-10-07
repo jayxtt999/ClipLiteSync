@@ -52,6 +52,7 @@ public:
     using LastSeqLoader = std::function<std::int64_t()>;
     using LastSeqSaver = std::function<void(std::int64_t)>;
     using StateHandler = std::function<void(SyncState)>;
+    using DebugLog = std::function<void(const char*)>;
 
     SyncManager() = default;
     ~SyncManager() { Stop(); }
@@ -66,6 +67,7 @@ public:
         saveLastSeq_ = std::move(saver);
     }
     void SetStateHandler(StateHandler handler) { stateHandler_ = std::move(handler); }
+    void SetDebugLog(DebugLog log) { debugLog_ = std::move(log); }
 
     // 启动/停止同步线程（幂等）
     void Start();
@@ -76,7 +78,8 @@ public:
     bool Publish(const SyncEvent& event);
 
     // 元数据事件（本地删除/置顶操作时调用；远端来的不需要再发布）
-    bool PublishMeta(const std::string& kind, const std::string& syncId, bool pinned);
+    bool PublishMeta(const std::string& kind, const std::string& syncId,
+                     std::uint64_t hash, bool pinned);
 
     SyncState state() const { return state_.load(); }
     std::int64_t lastSeq() const { return lastSeq_.load(); }
@@ -94,6 +97,7 @@ private:
     bool seenSyncId(const std::string& syncId);
     void rememberSyncId(const std::string& syncId);
     void setState(SyncState s);
+    void log(const char* message) const;
 
     static std::string buildEventJson(const SyncEvent& e);
     static bool parseUrl(const std::wstring& url, std::wstring& host, int& port, bool& secure,
@@ -104,6 +108,7 @@ private:
     LastSeqLoader loadLastSeq_;
     LastSeqSaver saveLastSeq_;
     StateHandler stateHandler_;
+    DebugLog debugLog_;
 
     std::atomic<SyncState> state_{SyncState::Stopped};
     std::atomic<bool> running_{false};

@@ -16,6 +16,8 @@
 #include "theme.h"
 #include "thumbnail_cache.h"
 #include "popup_preview_renderer.h"
+#include "sync/sync_manager.h"
+#include "sync/sync_util.h"
 
 #include <algorithm>
 #include <atomic>
@@ -271,6 +273,7 @@ constexpr int kSettingsAboutPage = 5;
 constexpr int kTrayOpen = 200;
 constexpr int kTraySettings = 201;
 constexpr int kTrayExit = 202;
+constexpr int kTraySyncToggle = 203;
 constexpr int kIconResource = 101;
 constexpr int kSupportCopyGroup = 300;
 constexpr int kSupportPaymentWidth = 720;
@@ -311,6 +314,9 @@ struct Settings {
     int sensitiveExpiryHours = 0;
     std::string updateProxy;
     int language = -1; // -1 system, 0 English, 1 Simplified Chinese
+    bool syncEnabled = false;       // 剪贴板多设备同步
+    std::string syncServer;         // 例 ws://192.168.1.10:8765/ws（UTF-8）
+    std::string syncToken;          // 设备 token（服务端邀请码换取）
     std::vector<std::string> categories{"General", "Work", "Code", "Links"};
     ShortcutBinding historyHotkey{MOD_ALT, 'V'};
     ShortcutBinding settingsHotkey{MOD_CONTROL | MOD_ALT, 'S'};
@@ -595,6 +601,7 @@ struct AppState {
     std::deque<std::function<void()>> storeJobs;
     std::thread storeWorker;
     bool storeWorkerStop = false;
+    clipsync::SyncManager sync;
     int benchmarkExitCode = 0;
     std::uint64_t ignoredClipboardHash = 0;
     std::uint64_t ignoredClipboardTextHash = 0;
@@ -685,12 +692,24 @@ HANDLE createSingleInstanceMutex() {
     const bool securityReady = ConvertStringSecurityDescriptorToSecurityDescriptorW(
         L"D:(A;;GA;;;WD)", SDDL_REVISION_1, &descriptor, nullptr) != FALSE;
     if (securityReady) attributes.lpSecurityDescriptor = descriptor;
+    // 测试实例（CLIPLITE_TEST_DATA_DIR 隔离数据目录）使用独立锁名，可与正式实例并行运行
+    wchar_t testDir[MAX_PATH]{};
+    const bool isTestInstance = GetEnvironmentVariableW(
+        L"CLIPLITE_TEST_DATA_DIR", testDir, ARRAYSIZE(testDir)) > 0;
     HANDLE mutex = CreateMutexW(securityReady ? &attributes : nullptr, TRUE,
-                                L"ClipLite.SingleInstance");
+                                isTestInstance ? L"ClipLite.SingleInstance.Test"
+                                               : L"ClipLite.SingleInstance");
     const DWORD error = GetLastError();
     if (descriptor) LocalFree(descriptor);
     SetLastError(error);
     return mutex;
+}
+
+// 测试实例使用独立窗口类名，避免单实例转发/退出消息串扰正式实例
+const wchar_t* hiddenWindowClassName() {
+    wchar_t testDir[MAX_PATH]{};
+    return GetEnvironmentVariableW(L"CLIPLITE_TEST_DATA_DIR", testDir, ARRAYSIZE(testDir)) > 0
+        ? L"ClipLiteHidden.Test" : L"ClipLiteHidden";
 }
 
 struct PopupSearchResult {
@@ -1268,6 +1287,63 @@ std::wstring settingsPath() {
     return clipLiteDataDirectory() + L"\\settings.ini";
 }
 
+// ---------- ClipSync 同步（协议见 docs/clip-sync-protocol.md） ----------
+
+std::wstring syncStatePath() {
+    return clipLiteDataDirectory() + L"\\sync_state.txt";
+}
+
+std::int64_t loadSyncLastSeq() {
+    std::FILE* file = nullptr;
+    std::int64_t value = 0;
+    if (_wfopen_s(&file, syncStatePath().c_str(), L"rb") == 0 && file) {
+        char buffer[32]{};
+        if (std::fgets(buffer, sizeof(buffer), file)) {
+            value = static_cast<std::int64_t>(_strtoui64(buffer, nullptr, 10));
+        }
+        std::fclose(file);
+    }
+    return value;
+}
+
+void saveSyncLastSeq(std::int64_t value) {
+    std::FILE* file = nullptr;
+    if (_wfopen_s(&file, syncStatePath().c_str(), L"wb") == 0 && file) {
+        std::fprintf(file, "%lld", static_cast<long long>(value));
+        std::fclose(file);
+    }
+}
+
+// 本机剪贴板入库成功后发布同步事件（在 storage worker 线程调用，SyncManager 内部排队）
+void publishClipAddSync(ClipType type, const std::string& payload, std::uint64_t hash,
+                        const std::string& source) {
+    if (!g_app || !g_app->settingsData.syncEnabled) return;
+    clipsync::SyncEvent event;
+    event.kind = "clip.add";
+    event.clipType = static_cast<int>(type);
+    event.hash = hash;
+    event.sourceApp = source;
+    event.ts = clipsync::unixNowMs();
+    // 一期：文件清单不同步本体（远端无对应文件），标记仅本机；小文件打包 zip 为后续版本
+    if (type == ClipType::Files) {
+        event.localOnly = true;
+    } else {
+        event.payload = payload;
+    }
+    const bool accepted = g_app->sync.Publish(event);
+    appendDiagnosticLog(accepted ? "INFO" : "WARN",
+                        accepted ? "sync: clip.add published to outbox"
+                                 : "sync: publish rejected (offline/outbox full/oversized)");
+}
+
+// 本地删除/置顶后发布元数据事件（kind: clip.delete / clip.pin；删除需在 remove 之前调用）
+void publishClipMetaSync(std::size_t index, const char* kind, bool pinned) {
+    if (!g_app || !g_app->settingsData.syncEnabled) return;
+    const auto& items = g_app->store.items();
+    if (index >= items.size()) return;
+    g_app->sync.PublishMeta(kind, clipsync::makeSyncId(), items[index].hash, pinned);
+}
+
 std::wstring themesPath() {
     return clipLiteDataDirectory() + L"\\themes.ini";
 }
@@ -1514,6 +1590,17 @@ void loadSettings(Settings& settings) {
         readShortcutValue("shortcutPopupDeleteKey=", settings.popupDeleteHotkey.virtualKey);
         readShortcutValue("shortcutPopupPreviewModifiers=", settings.popupPreviewHotkey.modifiers);
         readShortcutValue("shortcutPopupPreviewKey=", settings.popupPreviewHotkey.virtualKey);
+        if (std::strncmp(line, "syncEnabled=", 12) == 0) settings.syncEnabled = std::strncmp(line, "syncEnabled=1", 13) == 0;
+        if (std::strncmp(line, "syncServer=", 11) == 0) {
+            std::string value = line + 11;
+            while (!value.empty() && (value.back() == '\r' || value.back() == '\n')) value.pop_back();
+            settings.syncServer = value;
+        }
+        if (std::strncmp(line, "syncToken=", 10) == 0) {
+            std::string value = line + 10;
+            while (!value.empty() && (value.back() == '\r' || value.back() == '\n')) value.pop_back();
+            settings.syncToken = value;
+        }
     }
     std::fclose(file);
     if (settings.themeMode < 0) settings.themeMode = settings.dark ? 2 : 1;
@@ -1577,6 +1664,9 @@ void saveSettings(const Settings& settings) {
            << "sensitiveExpiryHours=" << settings.sensitiveExpiryHours << "\n"
            << "updateProxy=" << settings.updateProxy << "\n"
            << "language=" << settings.language << "\n"
+           << "syncEnabled=" << (settings.syncEnabled ? 1 : 0) << "\n"
+           << "syncServer=" << settings.syncServer << "\n"
+           << "syncToken=" << settings.syncToken << "\n"
            << "shortcutHistoryModifiers=" << settings.historyHotkey.modifiers << "\n"
            << "shortcutHistoryKey=" << settings.historyHotkey.virtualKey << "\n"
            << "shortcutSettingsModifiers=" << settings.settingsHotkey.modifiers << "\n"
@@ -5397,6 +5487,10 @@ void showTrayMenu() {
     AppendMenuW(menu, MF_STRING, kTrayOpen, settingsLocale().trayOpen);
     AppendMenuW(menu, MF_STRING, kTraySettings, settingsLocale().traySettings);
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (g_app->settingsData.syncEnabled ? MF_CHECKED : MF_UNCHECKED),
+                kTraySyncToggle,
+                languageIsChinese() ? (g_app->settingsData.syncEnabled ? L"同步：已开启" : L"同步：已关闭")
+                                    : (g_app->settingsData.syncEnabled ? L"Sync: On" : L"Sync: Off"));
     AppendMenuW(menu, MF_STRING, kTrayExit, settingsLocale().trayExit);
     POINT point{};
     GetCursorPos(&point);
@@ -5406,6 +5500,20 @@ void showTrayMenu() {
     DestroyMenu(menu);
     if (command == kTrayOpen) showPopup();
     else if (command == kTraySettings) openSettings();
+    else if (command == kTraySyncToggle) {
+        g_app->settingsData.syncEnabled = !g_app->settingsData.syncEnabled;
+        if (g_app->settingsData.syncEnabled && !g_app->settingsData.syncServer.empty() &&
+            !g_app->settingsData.syncToken.empty()) {
+            clipsync::SyncConfig syncConfig;
+            syncConfig.serverUrl = utf8ToWide(g_app->settingsData.syncServer);
+            syncConfig.deviceToken = utf8ToWide(g_app->settingsData.syncToken);
+            g_app->sync.SetConfig(syncConfig);
+            g_app->sync.Start();
+        } else {
+            g_app->sync.Stop();
+        }
+        saveSettings(g_app->settingsData);
+    }
     else if (command == kTrayExit) PostQuitMessage(0);
 }
 
@@ -12207,6 +12315,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                             if (!g_app->store.appendOrUpdate(type, payload, hash, source, expiresAt)) {
                                 appendDiagnosticLog("ERROR", "clipboard: unable to append history record");
                             } else {
+                                publishClipAddSync(type, payload, hash, source);
                                 if ((limits.maxItems > 0 || limits.maxDiskMb > 0) &&
                                     !g_app->store.pruneCategory(categoryType,
                                         static_cast<std::size_t>(limits.maxItems),
@@ -13086,6 +13195,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                                      static_cast<UINT>(wParam))) sendPaste();
             else if (shortcutMatches(g_app->settingsData.popupDeleteHotkey,
                                      static_cast<UINT>(wParam)) && !g_app->visible.empty()) {
+                publishClipMetaSync(g_app->visible[static_cast<std::size_t>(g_app->selected)], "clip.delete", false);
                 g_app->store.remove(g_app->visible[static_cast<std::size_t>(g_app->selected)]);
                 refreshVisible(true);
             } else if (shortcutMatches(g_app->settingsData.popupSettingsHotkey,
@@ -13330,6 +13440,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                     GET_Y_LPARAM(lParam) >= rowTop + rowHeight - ui(30) &&
                     GET_Y_LPARAM(lParam) < rowTop + rowHeight;
                 if (deleteClick) {
+                    publishClipMetaSync(g_app->visible[static_cast<std::size_t>(row)], "clip.delete", false);
                     g_app->store.remove(g_app->visible[static_cast<std::size_t>(row)]);
                     refreshVisible(true);
                     refreshPopupPointerState(hwnd);
@@ -13337,6 +13448,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 }
                 if (pinClick) {
                     if (g_app->store.togglePinned(g_app->visible[static_cast<std::size_t>(row)])) {
+                        publishClipMetaSync(g_app->visible[static_cast<std::size_t>(row)], "clip.pin",
+                                            g_app->store.items()[g_app->visible[static_cast<std::size_t>(row)]].pinned);
                         if (g_app->pinnedOnly) refreshVisible();
                         else invalidatePopupHover(hwnd, row, -1, false);
                     }
@@ -13383,7 +13496,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                  else if (command == kMenuPaste) sendPaste();
                 else if (command == kMenuPastePlain) sendPaste(PasteMode::PlainText);
                 else if (command == kMenuPasteRich) sendPaste(PasteMode::RichText);
-                 else if (command == kMenuDelete) g_app->store.remove(index);
+                else if (command == kMenuDelete) {
+                    publishClipMetaSync(index, "clip.delete", false);
+                    g_app->store.remove(index);
+                }
                  else if (command == kMenuFilter) showPopupFilterMenu(hwnd);
                  else if (command != 0) applyFilterCommand(command);
                  refreshVisible(command == kMenuDelete);
@@ -13591,7 +13707,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
             return 2;
         }
         appendDiagnosticLog("INFO", "startup: existing instance received launch request");
-        HWND existing = FindWindowExW(HWND_MESSAGE, nullptr, L"ClipLiteHidden", nullptr);
+        HWND existing = FindWindowExW(HWND_MESSAGE, nullptr, hiddenWindowClassName(), nullptr);
         if (existing) {
             if (commandExit) {
                 DWORD processId = 0;
@@ -13717,13 +13833,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
     supportClass.lpszClassName = L"ClipLiteSupport";
     RegisterClassW(&supportClass);
     WNDCLASSW hiddenClass = popupClass;
-    hiddenClass.lpszClassName = L"ClipLiteHidden";
+    hiddenClass.lpszClassName = hiddenWindowClassName();
     RegisterClassW(&hiddenClass);
     WNDCLASSW taskbarClass = hiddenClass;
     taskbarClass.lpszClassName = L"ClipLiteTaskbar";
     RegisterClassW(&taskbarClass);
 
-    app.hidden = CreateWindowExW(0, L"ClipLiteHidden", L"ClipLite", 0, 0, 0, 0, 0,
+    app.hidden = CreateWindowExW(0, hiddenWindowClassName(), L"ClipLite", 0, 0, 0, 0, 0,
                                  HWND_MESSAGE, nullptr, instance, nullptr);
     if (!app.hidden) {
         appendDiagnosticLog("ERROR", "startup: background window creation failed", GetLastError());
@@ -13755,6 +13871,60 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
         CloseHandle(mutex);
         return 1;
     }
+
+    // ---------- ClipSync 同步初始化 ----------
+    app.sync.SetStateHandler([](clipsync::SyncState state) {
+        appendDiagnosticLog("INFO",
+            state == clipsync::SyncState::Online ? "sync: state=online" :
+            state == clipsync::SyncState::Connecting ? "sync: state=connecting" :
+            state == clipsync::SyncState::Offline ? "sync: state=offline" : "sync: state=stopped");
+    });
+    app.sync.SetDebugLog([](const char* message) {
+        appendDiagnosticLog("INFO", message);
+    });
+    app.sync.SetLastSeqIo([] { return loadSyncLastSeq(); },
+                          [](std::int64_t value) { saveSyncLastSeq(value); });
+    // 远端事件回调运行在同步网络线程，必须经 storage worker 排队后才能访问 ClipStore
+    app.sync.SetRemoteClipHandler([](const clipsync::SyncEvent& event) {
+        appendDiagnosticLog("INFO", "sync: remote event received");
+        enqueueStorageJob([event] {
+            if (event.kind == "clip.add") {
+                // 文件清单条目仅本机（远端无文件本体），跳过
+                if (event.localOnly || event.payload.empty()) return;
+                const ClipType type = static_cast<ClipType>(event.clipType);
+                const std::uint64_t hash = clipboardDedupHash(type, event.payload);
+                appendDiagnosticLog("INFO", "sync: clip.add hash computed");
+                if (g_app->store.findHash(hash) != g_app->store.activeCount()) return; // 已存在，去重
+                if (g_app->store.appendOrUpdate(type, event.payload, hash, "clip-sync")) {
+                    appendDiagnosticLog("INFO", "sync: remote clip appended");
+                    PostMessageW(g_app->hidden, kStoreChangedMessage, 0, 0);
+                } else {
+                    appendDiagnosticLog("ERROR", "sync: remote clip append failed");
+                }
+            } else if (event.kind == "clip.delete" || event.kind == "clip.pin") {
+                const std::size_t index = g_app->store.findHash(event.hash);
+                if (index == g_app->store.activeCount()) return;
+                if (event.kind == "clip.delete") {
+                    g_app->store.remove(index);
+                } else if (g_app->store.items()[index].pinned != event.pinned) {
+                    g_app->store.togglePinned(index);
+                } else {
+                    return;
+                }
+                PostMessageW(g_app->hidden, kStoreChangedMessage, 0, 0);
+            }
+        });
+    });
+    if (app.settingsData.syncEnabled && !app.settingsData.syncServer.empty() &&
+        !app.settingsData.syncToken.empty()) {
+        clipsync::SyncConfig syncConfig;
+        syncConfig.serverUrl = utf8ToWide(app.settingsData.syncServer);
+        syncConfig.deviceToken = utf8ToWide(app.settingsData.syncToken);
+        app.sync.SetConfig(syncConfig);
+        app.sync.Start();
+        appendDiagnosticLog("INFO", "sync: manager started");
+    }
+
     SetTimer(app.hidden, kExpiryTimer, 60000, nullptr);
     if (!AddClipboardFormatListener(app.hidden)) {
         appendDiagnosticLog("ERROR", "startup: clipboard listener registration failed", GetLastError());

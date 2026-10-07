@@ -79,10 +79,12 @@ bool SyncManager::Publish(const SyncEvent& event) {
     return true;
 }
 
-bool SyncManager::PublishMeta(const std::string& kind, const std::string& syncId, bool pinned) {
+bool SyncManager::PublishMeta(const std::string& kind, const std::string& syncId,
+                              std::uint64_t hash, bool pinned) {
     SyncEvent e;
     e.kind = kind;
     e.syncId = syncId;
+    e.hash = hash;
     e.ts = unixNowMs();
     e.pinned = pinned;
     return Publish(e);
@@ -145,6 +147,7 @@ void SyncManager::senderLoop() {
         if (sendFrameText(frame)) {
             rememberSyncId(event.syncId);
         } else {
+            log("sender: send failed, requeued");
             std::lock_guard<std::mutex> lock(outboxMutex_);
             outbox_.push_front(event);
         }
@@ -196,16 +199,12 @@ bool SyncManager::connectAndSession() {
                                   nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!request_) return false;
 
-    // WebSocket 升级头（Key 由应用生成，WinHTTP 负责 Accept 校验与协议升级）
-    char keyRaw[16];
-    for (auto& b : keyRaw) b = static_cast<char>(rand() & 0xFF);
-    std::string keyB64 = base64Encode(std::string(keyRaw, sizeof(keyRaw)));
-    std::wstring headers = L"Connection: Upgrade\r\nUpgrade: websocket\r\n"
-                           L"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " +
-                           std::wstring(keyB64.begin(), keyB64.end()) + L"\r\n";
-    BOOL upgrade = TRUE;
-    WinHttpSetOption(static_cast<HINTERNET>(request_), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET,
-                     &upgrade, sizeof(upgrade));
+    // WebSocket 升级：该选项为"空标记"型——必须传 (nullptr, 0)，传 BOOL 缓冲会报 87；
+    // 设置后 Connection/Upgrade/Sec-WebSocket-* 头由 WinHTTP 自动生成，应用只带业务头。
+    if (!WinHttpSetOption(static_cast<HINTERNET>(request_), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET,
+                          nullptr, 0)) {
+        return false;
+    }
 
     std::wstring tokenHeader = L"Authorization: Bearer " + config_.deviceToken + L"\r\n";
     if (!WinHttpSendRequest(static_cast<HINTERNET>(request_), tokenHeader.c_str(), -1,
@@ -245,6 +244,7 @@ bool SyncManager::sendFrameText(const std::string& text) {
                                      WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
                                      reinterpret_cast<void*>(const_cast<char*>(text.data())),
                                      static_cast<DWORD>(text.size()));
+    if (err != NO_ERROR) log("sendFrame: WinHttpWebSocketSend error");
     return err == NO_ERROR;
 }
 
@@ -410,6 +410,10 @@ void SyncManager::setState(SyncState s) {
     if (stateHandler_) stateHandler_(s);
 }
 
+void SyncManager::log(const char* message) const {
+    if (debugLog_) debugLog_(message);
+}
+
 // ---------- 事件组帧 ----------
 
 std::string SyncManager::buildEventJson(const SyncEvent& e) {
@@ -423,9 +427,10 @@ std::string SyncManager::buildEventJson(const SyncEvent& e) {
             os << ",\"payloadB64\":\"" << base64Encode(e.payload) << "\"";
         }
     } else if (e.kind == "clip.pin") {
-        os << ",\"pinned\":" << (e.pinned ? "true" : "false");
+        os << ",\"hash\":" << e.hash << ",\"pinned\":" << (e.pinned ? "true" : "false");
+    } else if (e.kind == "clip.delete") {
+        os << ",\"hash\":" << e.hash;
     }
-    // clip.delete 无附加字段
     os << "}";
     return os.str();
 }

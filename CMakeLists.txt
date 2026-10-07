@@ -20,14 +20,18 @@ add_executable(ClipLite WIN32
     src/popup_preview_renderer.cpp
     src/clip_store.cpp
     src/thumbnail_cache.cpp
+    src/sync/sync_manager.cpp
     include/clip_store.h
     include/theme.h
     include/popup_preview_renderer.h
     include/thumbnail_cache.h
+    src/sync/sync_manager.h
+    src/sync/sync_util.h
+    src/sync/sync_json.h
     resources/clipLite.rc
 )
 
-target_include_directories(ClipLite PRIVATE include)
+target_include_directories(ClipLite PRIVATE include src)
 target_compile_definitions(ClipLite PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(ClipLite PRIVATE user32 gdi32 msimg32 shell32 shcore ole32 oleaut32 taskschd comctl32 comdlg32 crypt32 gdiplus windowscodecs d2d1 dwmapi advapi32 winhttp)
 
@@ -54,4 +58,11 @@ if(BUILD_TESTING)
     target_compile_definitions(ClipLiteThemeTests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(ClipLiteThemeTests PRIVATE user32)
     add_test(NAME ClipLiteThemes COMMAND ClipLiteThemeTests)
+
+    add_executable(ClipLiteSyncJsonTests
+        tests/sync_json_tests.cpp
+    )
+    target_include_directories(ClipLiteSyncJsonTests PRIVATE src)
+    target_compile_definitions(ClipLiteSyncJsonTests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME ClipLiteSyncJson COMMAND ClipLiteSyncJsonTests)
 endif()

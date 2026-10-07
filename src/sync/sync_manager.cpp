@@ -1,6 +1,13 @@
 // ClipSync 客户端同步管理器实现。
-// 注意：本模块尚未在 MSVC 下编译验证（当前开发机无 VS/CMake 工具链），
 // 接入前先跑 tests/sync_json_tests.cpp 与一次真实连接联调。
+
+// WinHTTP WebSocket API 需要 Win8+（NTDDI_WIN8）版本宏，且必须先于 windows.h/winhttp.h
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0603
+#endif
+#ifndef NTDDI_VERSION
+#define NTDDI_VERSION NTDDI_WIN8
+#endif
 
 #include "sync_manager.h"
 
@@ -148,15 +155,21 @@ void SyncManager::senderLoop() {
 
 bool SyncManager::parseUrl(const std::wstring& url, std::wstring& host, int& port, bool& secure,
                            std::wstring& path) {
+    // WinHttpCrackUrl 只认 http/https，ws/wss 先改写（wss 默认 443 由 crack 补齐）
+    std::wstring httpUrl = url;
+    if (httpUrl.rfind(L"ws://", 0) == 0) httpUrl = L"http://" + httpUrl.substr(5);
+    else if (httpUrl.rfind(L"wss://", 0) == 0) httpUrl = L"https://" + httpUrl.substr(6);
+    else return false; // 仅接受 ws:// 或 wss://
+
     URL_COMPONENTS parts{};
     parts.dwStructSize = sizeof(parts);
     parts.dwSchemeLength = (DWORD)-1;
     parts.dwHostNameLength = (DWORD)-1;
     parts.dwUrlPathLength = (DWORD)-1;
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts)) return false;
+    if (!WinHttpCrackUrl(httpUrl.c_str(), 0, 0, &parts)) return false;
     host.assign(parts.lpszHostName, parts.dwHostNameLength);
     port = parts.nPort;
-    secure = parts.nScheme == INTERNET_SCHEME_HTTPS || parts.nScheme == INTERNET_SCHEME_WSS;
+    secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
     path.assign(parts.lpszUrlPath && parts.dwUrlPathLength ? parts.lpszUrlPath : L"/");
     if (path.empty() || path[0] != L'/') path = L"/" + path;
     return true;
@@ -213,7 +226,7 @@ bool SyncManager::connectAndSession() {
 
 void SyncManager::closeSocket() {
     if (socket_) {
-        WinHttpWebSocketClose(static_cast<HWEB_SOCKET>(socket_), WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS,
+        WinHttpWebSocketClose(static_cast<HINTERNET>(socket_), WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS,
                               nullptr, 0);
         WinHttpCloseHandle(static_cast<HINTERNET>(socket_));
         socket_ = nullptr;
@@ -227,10 +240,12 @@ bool SyncManager::sendFrameText(const std::string& text) {
     void* sock = socket_;
     if (!sock) return false;
     std::lock_guard<std::mutex> lock(sendMutex_);
-    return WinHttpWebSocketSend(static_cast<HWEB_SOCKET>(sock),
-                                WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-                                reinterpret_cast<void*>(const_cast<char*>(text.data())),
-                                static_cast<DWORD>(text.size())) != FALSE;
+    // WinHTTP WebSocket 接口返回 DWORD 错误码（NO_ERROR=成功）
+    DWORD err = WinHttpWebSocketSend(static_cast<HINTERNET>(sock),
+                                     WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                                     reinterpret_cast<void*>(const_cast<char*>(text.data())),
+                                     static_cast<DWORD>(text.size()));
+    return err == NO_ERROR;
 }
 
 bool SyncManager::receiveFrame(std::string& text, bool& closed) {
@@ -242,9 +257,9 @@ bool SyncManager::receiveFrame(std::string& text, bool& closed) {
     WINHTTP_WEB_SOCKET_BUFFER_TYPE type = WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
     char chunk[8192];
     for (;;) {
-        if (!WinHttpWebSocketReceive(static_cast<HWEB_SOCKET>(sock), chunk, sizeof(chunk), &done, &type)) {
-            return false;
-        }
+        DWORD err = WinHttpWebSocketReceive(static_cast<HINTERNET>(sock), chunk, sizeof(chunk),
+                                            &done, &type);
+        if (err != NO_ERROR) return false;
         switch (type) {
         case WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE:
         case WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE:
@@ -254,10 +269,8 @@ bool SyncManager::receiveFrame(std::string& text, bool& closed) {
         case WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE:
             closed = true;
             return true;
-        case WINHTTP_WEB_SOCKET_PONG_BUFFER_TYPE:
-            continue; // 服务端 pong，忽略
         default:
-            return false; // 二进制帧不在协议内
+            return false; // 二进制帧不在协议内（PING/PONG 由 WinHTTP 内部处理，不会到达这里）
         }
     }
 }

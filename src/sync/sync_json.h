@@ -6,6 +6,7 @@
 // 字符串按 UTF-8 原样存储；\uXXXX 解码为 UTF-8。
 
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -19,6 +20,10 @@ public:
     Type type = Type::Null;
     bool b = false;
     double num = 0;
+    // 整数精确存储：double 只能精确表示 2^53 以内的数，而 hash 是 uint64，
+    // 超出会失真。纯整数字面量经 strtoull 存入 i（位模式，可承载完整 uint64）。
+    std::int64_t i = 0;
+    bool isInt = false;
     std::string str;
     std::vector<JValue> arr;
     std::map<std::string, JValue> obj;
@@ -34,7 +39,8 @@ public:
         return it == obj.end() ? nullValue : it->second;
     }
     std::int64_t asInt(std::int64_t def = 0) const {
-        return type == Type::Number ? static_cast<std::int64_t>(num) : def;
+        if (type != Type::Number) return def;
+        return isInt ? i : static_cast<std::int64_t>(num);
     }
     std::string asString(const std::string& def = {}) const {
         return type == Type::String ? str : def;
@@ -198,16 +204,25 @@ private:
         std::size_t start = pos_;
         if (pos_ < text_.size() && (text_[pos_] == '-' || text_[pos_] == '+')) ++pos_;
         bool hasDigit = false;
+        bool pureInteger = true;
         while (pos_ < text_.size()) {
             char c = text_[pos_];
-            if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '-' || c == '+') {
-                if (c >= '0' && c <= '9') hasDigit = true;
-                ++pos_;
-            } else break;
+            if (c >= '0' && c <= '9') { hasDigit = true; ++pos_; continue; }
+            if (c == '.' || c == 'e' || c == 'E') { pureInteger = false; ++pos_; continue; }
+            if (c == '-' || c == '+') { pureInteger = false; ++pos_; continue; }
+            break;
         }
         if (!hasDigit) return false;
         out.type = JValue::Type::Number;
-        out.num = std::stod(text_.substr(start, pos_ - start));
+        std::string digits = text_.substr(start, pos_ - start);
+        if (pureInteger) {
+            // strtoull 承载 uint64 全量位模式（含 > INT64_MAX 的 hash）
+            out.i = static_cast<std::int64_t>(std::strtoull(digits.c_str(), nullptr, 10));
+            out.isInt = true;
+            out.num = static_cast<double>(out.i);
+        } else {
+            out.num = std::stod(digits);
+        }
         return true;
     }
 };

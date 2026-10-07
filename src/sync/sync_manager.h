@@ -115,7 +115,7 @@ private:
     std::deque<SyncEvent> outbox_;
 
     std::mutex seqMutex_;
-    std::int64_t lastSeq_ = 0;
+    std::atomic<std::int64_t> lastSeq_{0}; // 读侧无锁（UI 线程轮询状态）
 
     std::mutex seenMutex_;
     std::deque<std::string> seenIds_; // FIFO 去重表（容量 512）

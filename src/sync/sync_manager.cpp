@@ -455,4 +455,87 @@ std::string SyncManager::buildEventJson(const SyncEvent& e) {
     return os.str();
 }
 
+// ---------- 一次性配对（REST，独立于 WS 数据面） ----------
+
+bool SyncManager::DeviceJoin(const std::wstring& serverUrl, const std::string& inviteCode,
+                             const std::string& deviceName, std::string& deviceId,
+                             std::string& deviceToken, std::string& errorUtf8) {
+    std::wstring host;
+    int port = 0;
+    bool secure = false;
+    std::wstring path;
+    if (!parseUrl(serverUrl, host, port, secure, path)) {
+        errorUtf8 = "服务器地址无效（需 ws:// 或 wss://）";
+        return false;
+    }
+    const HINTERNET session = WinHttpOpen(L"ClipLite-Sync/1.0",
+                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) {
+        errorUtf8 = "网络初始化失败";
+        return false;
+    }
+    bool ok = false;
+    const HINTERNET connection = WinHttpConnect(session, host.c_str(),
+                                                static_cast<INTERNET_PORT>(port), 0);
+    const HINTERNET request = connection
+        ? WinHttpOpenRequest(connection, L"POST", L"/v1/device/join", nullptr,
+                             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                             secure ? WINHTTP_FLAG_SECURE : 0)
+        : nullptr;
+    if (request) {
+        if (secure) {
+            // 局域网自签证书：不校验 CA/名称（与一期安全基线一致，公网建议正式证书）
+            DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                          SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                          SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+            WinHttpSetOption(request, WINHTTP_OPTION_SECURITY_FLAGS,
+                             &flags, sizeof(flags));
+        }
+        const std::string body = "{\"inviteCode\":\"" + jsonEscape(inviteCode) +
+                                 "\",\"deviceName\":\"" + jsonEscape(deviceName) + "\"}";
+        const wchar_t* headers = L"Content-Type: application/json\r\n";
+        if (WinHttpSendRequest(request, headers, static_cast<DWORD>(wcslen(headers)),
+                               reinterpret_cast<LPVOID>(const_cast<char*>(body.data())),
+                               static_cast<DWORD>(body.size()),
+                               static_cast<DWORD>(body.size()), 0) &&
+            WinHttpReceiveResponse(request, nullptr)) {
+            DWORD status = 0;
+            DWORD size = sizeof(status);
+            WinHttpQueryHeaders(request,
+                                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
+            std::string response;
+            for (;;) {
+                char buffer[4096];
+                DWORD read = 0;
+                if (!WinHttpReadData(request, buffer, sizeof(buffer), &read) || read == 0) break;
+                response.append(buffer, read);
+            }
+            JValue json;
+            if (parseJson(response, json) && json.isObject()) {
+                if (status == 200) {
+                    deviceId = json.at("deviceId").asString();
+                    deviceToken = json.at("deviceToken").asString();
+                    ok = !deviceId.empty() && !deviceToken.empty();
+                    if (!ok) errorUtf8 = "服务端响应缺少字段";
+                } else {
+                    errorUtf8 = json.at("error").asString();
+                    if (errorUtf8.empty()) errorUtf8 = "配对失败（HTTP " + std::to_string(status) + "）";
+                }
+            } else {
+                errorUtf8 = "服务端响应解析失败";
+            }
+        } else {
+            errorUtf8 = "无法连接服务器";
+        }
+    } else {
+        errorUtf8 = "创建请求失败";
+    }
+    if (request) WinHttpCloseHandle(request);
+    if (connection) WinHttpCloseHandle(connection);
+    WinHttpCloseHandle(session);
+    return ok;
+}
+
 } // namespace clipsync

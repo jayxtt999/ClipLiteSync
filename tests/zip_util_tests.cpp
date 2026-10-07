@@ -50,7 +50,7 @@ static void testRejectCorrupt() {
     CHECK(readZip("PK", decoded) == false);
     // 破坏 EOCD
     std::string badEocd = zip;
-    badEocd[badEocd.size() - 4] = 0x99;
+    badEocd[badEocd.size() - 4] = static_cast<char>(0x99);
     CHECK(readZip(badEocd, decoded) == false);
     // 篡改条目数据（CRC 不匹配）
     std::string badCrc = zip;

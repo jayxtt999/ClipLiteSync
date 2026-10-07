@@ -134,6 +134,12 @@ constexpr int kSettingThemeDuplicate = 73;
 constexpr int kSettingThemeDelete = 74;
 constexpr int kSettingThemeSave = 75;
 constexpr int kSettingThemeName = 99;
+constexpr int kSettingSyncEnabled = 80;
+constexpr int kSettingSyncServer = 81;
+constexpr int kSettingSyncInvite = 82;
+constexpr int kSettingSyncPair = 83;
+constexpr int kSettingSyncUnpair = 84;
+constexpr int kSettingSyncStatus = 85;
 constexpr int kSettingThemeColorBase = 100;
 constexpr int kSettingThemeSwatchBase = 120;
 constexpr std::array<std::size_t, 14> kEditableThemeColorIndices = {
@@ -180,6 +186,7 @@ constexpr UINT kPopupPreviewKeyMessage = WM_APP + 14;
 constexpr UINT kStoreChangedMessage = WM_APP + 15;
 constexpr UINT kPastePayloadLoadedMessage = WM_APP + 16;
 constexpr UINT kUpdateCheckCompleteMessage = WM_APP + 17;
+constexpr UINT kSyncPairResultMessage = WM_APP + 18;
 constexpr UINT_PTR kExpiryTimer = 3;
 constexpr UINT_PTR kClipboardCaptureTimer = 7;
 constexpr UINT_PTR kSettingsToggleTimer = 4;
@@ -189,6 +196,7 @@ constexpr UINT_PTR kSettingsSyncTimer = 6;
 constexpr UINT_PTR kSettingsThemeTimer = 7;
 constexpr UINT_PTR kSettingsActionFeedbackTimer = 8;
 constexpr UINT_PTR kSettingsEncryptionTimer = 9;
+constexpr UINT_PTR kSettingsSyncStateTimer = 14;
 constexpr UINT_PTR kPopupOpenGuardTimer = 10;
 constexpr UINT_PTR kPopupDeactivateTimer = 11;
 constexpr UINT_PTR kWinVReleaseTimer = 12;
@@ -272,7 +280,8 @@ constexpr int kSettingsAppearancePage = 1;
 constexpr int kSettingsShortcutPage = 2;
 constexpr int kSettingsStoragePage = 3;
 constexpr int kSettingsPrivacyPage = 4;
-constexpr int kSettingsAboutPage = 5;
+constexpr int kSettingsSyncPage = 5;
+constexpr int kSettingsAboutPage = 6;
 constexpr int kTrayOpen = 200;
 constexpr int kTraySettings = 201;
 constexpr int kTrayExit = 202;
@@ -320,6 +329,7 @@ struct Settings {
     bool syncEnabled = false;       // 剪贴板多设备同步
     std::string syncServer;         // 例 ws://192.168.1.10:8765/ws（UTF-8）
     std::string syncToken;          // 设备 token（服务端邀请码换取）
+    std::string syncDeviceId;       // 本机设备 ID（配对时服务端分配，用于跳过自己广播）
     std::vector<std::string> categories{"General", "Work", "Code", "Links"};
     ShortcutBinding historyHotkey{MOD_ALT, 'V'};
     ShortcutBinding settingsHotkey{MOD_CONTROL | MOD_ALT, 'S'};
@@ -605,6 +615,13 @@ struct AppState {
     std::thread storeWorker;
     bool storeWorkerStop = false;
     clipsync::SyncManager sync;
+    // 配对请求（后台线程 → UI 线程经 kSyncPairResultMessage 回传）
+    std::mutex syncPairMutex;
+    bool syncPairBusy = false;
+    bool syncPairOk = false;
+    std::string syncPairToken;
+    std::string syncPairDeviceId;
+    std::string syncPairError;
     int benchmarkExitCode = 0;
     std::uint64_t ignoredClipboardHash = 0;
     std::uint64_t ignoredClipboardTextHash = 0;
@@ -1488,6 +1505,185 @@ bool extractFileBundle(const clipsync::SyncEvent& event, std::string& payloadOut
     return !payloadOut.empty();
 }
 
+// 依据 settingsData 应用同步启停/重连（UI 线程与启动路径均可调用）
+void applySyncSettings() {
+    if (!g_app) return;
+    g_app->sync.Stop();
+    const Settings& s = g_app->settingsData;
+    if (!s.syncEnabled || s.syncServer.empty() || s.syncToken.empty()) return;
+    clipsync::SyncConfig config;
+    config.serverUrl = utf8ToWide(s.syncServer);
+    config.deviceToken = utf8ToWide(s.syncToken);
+    config.deviceId = utf8ToWide(s.syncDeviceId);
+    g_app->sync.SetConfig(config);
+    g_app->sync.Start();
+    appendDiagnosticLog("INFO", "sync: manager (re)started from settings");
+}
+
+HWND settingsControl(HWND settings, int id);
+
+// 刷新同步页"设备状态"只读框
+void refreshSyncStatusControl(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    HWND status = settingsControl(hwnd, kSettingSyncStatus);
+    if (!status) return;
+    const Settings& s = g_app->settingsData;
+    std::wstring text;
+    if (s.syncToken.empty()) {
+        text = languageIsChinese() ? L"未配对" : L"Not paired";
+    } else {
+        text = utf8ToWide(s.syncDeviceId);
+        if (!s.syncEnabled) {
+            text += languageIsChinese() ? L" · 已停用" : L" · disabled";
+        } else {
+            switch (g_app->sync.state()) {
+            case clipsync::SyncState::Online:     text += languageIsChinese() ? L" · 在线" : L" · online"; break;
+            case clipsync::SyncState::Connecting: text += languageIsChinese() ? L" · 连接中" : L" · connecting"; break;
+            case clipsync::SyncState::Offline:    text += languageIsChinese() ? L" · 离线" : L" · offline"; break;
+            default: break;
+            }
+        }
+    }
+    SetWindowTextW(status, text.c_str());
+}
+
+void saveSettings(const Settings& settings);
+void setSettingsToggleValue(HWND hwnd, bool enabled);
+
+// 读取编辑框内容并去除首尾空白（UTF-8）
+std::string syncTrimmedUtf8(HWND control) {
+    if (!control) return {};
+    const int length = GetWindowTextLengthW(control);
+    std::wstring text(static_cast<std::size_t>(length) + 1, L'\0');
+    GetWindowTextW(control, text.data(), length + 1);
+    text.resize(static_cast<std::size_t>(length));
+    while (!text.empty() && (text.front() == L' ' || text.front() == L'\t')) {
+        text.erase(text.begin());
+    }
+    while (!text.empty() && (text.back() == L' ' || text.back() == L'\t')) {
+        text.pop_back();
+    }
+    return wideToUtf8(text.c_str(), text.size());
+}
+
+// "配对"按钮：邀请码 → 设备 token（后台线程发起 REST 请求，不阻塞 UI）
+void handleSyncPairClicked(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        if (g_app->syncPairBusy) {
+            setSettingsActionFeedback(hwnd,
+                tr(L"Pairing in progress...", L"配对正在进行中..."), false);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return;
+        }
+    }
+    const std::string server = syncTrimmedUtf8(settingsControl(hwnd, kSettingSyncServer));
+    const std::string invite = syncTrimmedUtf8(settingsControl(hwnd, kSettingSyncInvite));
+    if (server.empty() || invite.empty()) {
+        setSettingsActionFeedback(hwnd,
+            tr(L"Enter the server address and invite code first.", L"请先填写服务器地址和邀请码。"),
+            false);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+    // 地址即刻生效保存，避免配对成功但地址没落盘
+    g_app->settingsData.syncServer = server;
+    saveSettings(g_app->settingsData);
+    wchar_t computerName[MAX_COMPUTERNAME_LENGTH + 1]{};
+    DWORD nameLength = ARRAYSIZE(computerName);
+    if (!GetComputerNameW(computerName, &nameLength) || nameLength == 0) {
+        wcscpy_s(computerName, L"Windows-PC");
+        nameLength = static_cast<DWORD>(wcslen(computerName));
+    }
+    const std::string deviceName = wideToUtf8(computerName, nameLength);
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        g_app->syncPairBusy = true;
+    }
+    if (HWND status = settingsControl(hwnd, kSettingSyncStatus)) {
+        SetWindowTextW(status, tr(L"Pairing...", L"配对中..."));
+    }
+    const HWND settingsWindow = hwnd;
+    std::thread([settingsWindow, server, invite, deviceName] {
+        std::string deviceId;
+        std::string token;
+        std::string error;
+        const bool ok = clipsync::SyncManager::DeviceJoin(utf8ToWide(server), invite,
+                                                          deviceName, deviceId, token, error);
+        appendDiagnosticLog(ok ? "INFO" : "WARN",
+                            ok ? "sync: pair join ok" : "sync: pair join failed");
+        if (g_app) {
+            std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+            g_app->syncPairOk = ok;
+            g_app->syncPairToken = ok ? token : std::string();
+            g_app->syncPairDeviceId = ok ? deviceId : std::string();
+            g_app->syncPairError = ok ? std::string() : error;
+            g_app->syncPairBusy = false;
+        }
+        PostMessageW(settingsWindow, kSyncPairResultMessage, 0, 0);
+    }).detach();
+}
+
+// 配对结果（kSyncPairResultMessage，UI 线程）
+void handleSyncPairResult(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    bool ok = false;
+    std::string token;
+    std::string deviceId;
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        ok = g_app->syncPairOk;
+        token = g_app->syncPairToken;
+        deviceId = g_app->syncPairDeviceId;
+        error = g_app->syncPairError;
+    }
+    if (ok) {
+        g_app->settingsData.syncToken = token;
+        g_app->settingsData.syncDeviceId = deviceId;
+        g_app->settingsData.syncEnabled = true; // 配对成功默认开启同步
+        saveSettings(g_app->settingsData);
+        if (HWND toggle = settingsControl(hwnd, kSettingSyncEnabled)) {
+            setSettingsToggleValue(toggle, true);
+        }
+        if (HWND invite = settingsControl(hwnd, kSettingSyncInvite)) {
+            SetWindowTextW(invite, L"");
+        }
+        applySyncSettings();
+        refreshSyncStatusControl(hwnd);
+        setSettingsActionFeedback(hwnd,
+            tr(L"Paired successfully. Sync enabled.", L"配对成功，同步已开启。"), true);
+    } else {
+        refreshSyncStatusControl(hwnd);
+        std::wstring message = tr(L"Pairing failed: ", L"配对失败：") + utf8ToWide(error);
+        setSettingsActionFeedback(hwnd, message, false);
+    }
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// "解除配对"按钮
+void handleSyncUnpairClicked(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    if (MessageBoxW(hwnd,
+                    tr(L"Clear pairing on this device and stop syncing?",
+                       L"确定清除本机配对并停止同步？"),
+                    L"ClipLite", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    g_app->settingsData.syncToken.clear();
+    g_app->settingsData.syncDeviceId.clear();
+    g_app->settingsData.syncEnabled = false;
+    saveSettings(g_app->settingsData);
+    if (HWND toggle = settingsControl(hwnd, kSettingSyncEnabled)) {
+        setSettingsToggleValue(toggle, false);
+    }
+    applySyncSettings();
+    refreshSyncStatusControl(hwnd);
+    setSettingsActionFeedback(hwnd, tr(L"Pairing cleared.", L"已清除本机配对。"), true);
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
 std::wstring themesPath() {
     return clipLiteDataDirectory() + L"\\themes.ini";
 }
@@ -1745,6 +1941,11 @@ void loadSettings(Settings& settings) {
             while (!value.empty() && (value.back() == '\r' || value.back() == '\n')) value.pop_back();
             settings.syncToken = value;
         }
+        if (std::strncmp(line, "syncDeviceId=", 13) == 0) {
+            std::string value = line + 13;
+            while (!value.empty() && (value.back() == '\r' || value.back() == '\n')) value.pop_back();
+            settings.syncDeviceId = value;
+        }
     }
     std::fclose(file);
     if (settings.themeMode < 0) settings.themeMode = settings.dark ? 2 : 1;
@@ -1811,6 +2012,7 @@ void saveSettings(const Settings& settings) {
            << "syncEnabled=" << (settings.syncEnabled ? 1 : 0) << "\n"
            << "syncServer=" << settings.syncServer << "\n"
            << "syncToken=" << settings.syncToken << "\n"
+           << "syncDeviceId=" << settings.syncDeviceId << "\n"
            << "shortcutHistoryModifiers=" << settings.historyHotkey.modifiers << "\n"
            << "shortcutHistoryKey=" << settings.historyHotkey.virtualKey << "\n"
            << "shortcutSettingsModifiers=" << settings.settingsHotkey.modifiers << "\n"
@@ -3131,7 +3333,7 @@ void drawMetadataTag(HDC dc, const RECT& rect, const std::wstring& value,
 }
 
 void drawSettingsNavIcon(HDC dc, int index, int x, int y, COLORREF color) {
-    if (!g_app || g_app->gdiplusToken == 0 || index < 0 || index > 5) return;
+    if (!g_app || g_app->gdiplusToken == 0 || index < 0 || index > 6) return;
     Gdiplus::Graphics graphics(dc);
     configureGdiGraphics(graphics);
     const float scale = static_cast<float>(g_uiDpi) / 96.0f;
@@ -3213,6 +3415,18 @@ void drawSettingsNavIcon(HDC dc, int index, int x, int y, COLORREF color) {
                           px(13.5f), py(7.5f), px(13.5f), py(8.5f));
         shackle.AddLine(px(13.5f), py(8.5f), px(13.5f), py(10.0f));
         graphics.DrawPath(&pen, &shackle);
+    } else if (index == 5) {
+        // 同步：上下两条弧线 + 箭头（循环同步）
+        Gdiplus::GraphicsPath top;
+        top.AddArc(px(5.0f), py(5.5f), 14.0f * scale, 8.0f * scale, 180.0f, -160.0f);
+        graphics.DrawPath(&pen, &top);
+        graphics.DrawLine(&pen, px(17.5f), py(7.5f), px(18.8f), py(10.0f));
+        graphics.DrawLine(&pen, px(17.5f), py(7.5f), px(15.0f), py(7.8f));
+        Gdiplus::GraphicsPath bottom;
+        bottom.AddArc(px(5.0f), py(10.5f), 14.0f * scale, 8.0f * scale, 20.0f, 160.0f);
+        graphics.DrawPath(&pen, &bottom);
+        graphics.DrawLine(&pen, px(6.5f), py(16.5f), px(5.2f), py(14.0f));
+        graphics.DrawLine(&pen, px(6.5f), py(16.5f), px(9.0f), py(16.2f));
     } else {
         graphics.DrawEllipse(&pen, px(4.0f), py(4.0f), 16.0f * scale, 16.0f * scale);
         graphics.DrawLine(&pen, px(12.0f), py(11.5f), px(12.0f), py(15.5f));
@@ -7196,6 +7410,21 @@ SettingsLayout buildSettingsLayout(HWND hwnd) {
                             {kSettingSensitiveExpiry}, {150}, {30}, contentWidth)
         }, 190);
         makeCard(settingsLocale().protectionScope, {}, 120);
+    } else if (g_app->settingsTab == kSettingsSyncPage) {
+        makeCard(tr(L"Clipboard sync", L"剪贴板同步"), {
+            makeSettingsRow(hwnd, tr(L"Enable sync", L"启用同步"),
+                            {kSettingSyncEnabled}, {36}, {20}, contentWidth),
+            makeSettingsRow(hwnd, tr(L"Server address", L"服务器地址"),
+                            {kSettingSyncServer}, {360}, {30}, contentWidth),
+            makeSettingsRow(hwnd, tr(L"Invite code", L"邀请码"),
+                            {kSettingSyncInvite, kSettingSyncPair}, {150, 80}, {30, 30}, contentWidth),
+            makeSettingsRow(hwnd, tr(L"Device status", L"设备状态"),
+                            {kSettingSyncStatus}, {250}, {30}, contentWidth)
+        });
+        makeCard(tr(L"Device", L"设备管理"), {
+            makeSettingsRow(hwnd, tr(L"Remove pairing from this device", L"清除本机配对，停止同步"),
+                            {kSettingSyncUnpair}, {108}, {30}, contentWidth)
+        }, 120);
     } else {
         makeCard(settingsLocale().about, {
             makeSettingsRow(hwnd, tr(L"Update proxy (optional)", L"更新代理地址（可选）"),
@@ -7255,7 +7484,8 @@ bool settingsTabIsScrollable() {
     return g_app && (g_app->settingsTab == 0 ||
                      g_app->settingsTab == kSettingsAppearancePage ||
                      g_app->settingsTab == kSettingsShortcutPage ||
-                     g_app->settingsTab == kSettingsStoragePage);
+                     g_app->settingsTab == kSettingsStoragePage ||
+                     g_app->settingsTab == kSettingsSyncPage);
 }
 
 // 计算设置页右侧滚动条的轨道、滑块和最大滚动距离。
@@ -7451,7 +7681,9 @@ void paintSettingsContent(HWND hwnd, HDC dc, bool bodyOnly = false) {
     const wchar_t* navLabels[] = {
         settingsLocale().navGeneral, settingsLocale().navAppearance,
         settingsLocale().navShortcuts, settingsLocale().navStorage,
-        settingsLocale().navPrivacy, settingsLocale().navAbout
+        settingsLocale().navPrivacy,
+        languageIsChinese() ? L"同步" : L"Sync",
+        settingsLocale().navAbout
     };
     const int activeTop = 50 + g_app->settingsTab * 38;
     if (!bodyOnly) {
@@ -7467,7 +7699,7 @@ void paintSettingsContent(HWND hwnd, HDC dc, bool bodyOnly = false) {
     SetTextColor(dc, secondary);
     RECT menuTitle{ui(24), ui(22), ui(156), ui(42)};
     DrawTextW(dc, L"ClipLite", -1, &menuTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 7; ++i) {
         const int top = 54 + i * 38;
         const bool active = i == g_app->settingsTab;
         const bool hovered = i == g_app->hoveredSettingsTab;
@@ -7483,7 +7715,9 @@ void paintSettingsContent(HWND hwnd, HDC dc, bool bodyOnly = false) {
     const wchar_t* titles[] = {
         settingsLocale().titleGeneral, settingsLocale().titleAppearance,
         settingsLocale().titleShortcuts, settingsLocale().titleStorage,
-        settingsLocale().titlePrivacy, settingsLocale().titleAbout
+        settingsLocale().titlePrivacy,
+        languageIsChinese() ? L"多设备同步" : L"Sync",
+        settingsLocale().titleAbout
     };
     RECT pageTitle{contentLeft, ui(20), contentRight, ui(48)};
     DrawTextW(dc, titles[g_app->settingsTab], -1, &pageTitle,
@@ -8702,6 +8936,39 @@ void createSettingsControlsModern(HWND hwnd) {
                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingBrowseDataDirectory)),
                   GetModuleHandleW(nullptr), nullptr);
 
+    // ---------- 同步页控件 ----------
+    createToggle(kSettingSyncEnabled, 520, 100, g_app->settingsData.syncEnabled);
+    CreateWindowExW(0, L"EDIT", utf8ToWide(g_app->settingsData.syncServer).c_str(),
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOHSCROLL,
+                    ui(520 - kSettingsSidebarWidth), ui(140 - kSettingsHeaderHeight),
+                    ui(360), ui(30), parent,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncServer)),
+                    GetModuleHandleW(nullptr), nullptr);
+    CreateWindowExW(0, L"EDIT", L"",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOHSCROLL,
+                    ui(520 - kSettingsSidebarWidth), ui(180 - kSettingsHeaderHeight),
+                    ui(150), ui(30), parent,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncInvite)),
+                    GetModuleHandleW(nullptr), nullptr);
+    CreateWindowW(L"BUTTON", tr(L"Pair", L"配对"),
+                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                  ui(678 - kSettingsSidebarWidth), ui(180 - kSettingsHeaderHeight),
+                  ui(80), ui(30), parent,
+                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncPair)),
+                  GetModuleHandleW(nullptr), nullptr);
+    CreateWindowExW(0, L"EDIT", L"",
+                    WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL,
+                    ui(520 - kSettingsSidebarWidth), ui(220 - kSettingsHeaderHeight),
+                    ui(250), ui(30), parent,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncStatus)),
+                    GetModuleHandleW(nullptr), nullptr);
+    CreateWindowW(L"BUTTON", tr(L"Unpair", L"解除配对"),
+                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                  ui(520 - kSettingsSidebarWidth), ui(260 - kSettingsHeaderHeight),
+                  ui(108), ui(30), parent,
+                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncUnpair)),
+                  GetModuleHandleW(nullptr), nullptr);
+
     std::wstring ignoredApps;
     for (const std::string& app : g_app->settingsData.ignoredApps) {
         if (!ignoredApps.empty()) ignoredApps += L"\r\n";
@@ -8866,6 +9133,8 @@ void updateSettingsTabControls(HWND hwnd, bool redraw) {
                          kSettingShortcutPasteRich, kSettingShortcutClosePopup,
                          kSettingShortcutPopupSettings, kSettingShortcutClearFilter,
                          kSettingShortcutDelete,
+                        kSettingSyncEnabled, kSettingSyncServer, kSettingSyncInvite,
+                        kSettingSyncPair, kSettingSyncUnpair, kSettingSyncStatus,
                         kSettingCategoryMaxBase, kSettingCategoryMaxBase + 1,
                         kSettingCategoryMaxBase + 2,
                          kSettingCategoryDiskBase, kSettingCategoryDiskBase + 1,
@@ -8980,6 +9249,12 @@ void updateSettingsTabControls(HWND hwnd, bool redraw) {
     }
     if (HWND save = settingsControl(hwnd, kSettingThemeSave)) {
         ShowWindow(save, appearancePage && g_app->themeEditorDraftActive ? SW_SHOW : SW_HIDE);
+    }
+    if (g_app->settingsTab == kSettingsSyncPage) {
+        refreshSyncStatusControl(hwnd);
+        SetTimer(hwnd, kSettingsSyncStateTimer, 1000, nullptr);
+    } else {
+        KillTimer(hwnd, kSettingsSyncStateTimer);
     }
     if (HWND deleteTheme = settingsControl(hwnd, kSettingThemeDelete)) {
         ShowWindow(deleteTheme, appearancePage && activeThemeIsCustom() &&
@@ -9614,7 +9889,8 @@ bool isSettingsToggle(int id) {
            id == kSettingStartupNotification || id == kSettingRunAsAdministrator ||
             id == kSettingSearchImeCompatibility || id == kSettingSearchOnOpen ||
             id == kSettingPromotePastedItem ||
-           id == kSettingPreviewAutomatic || id == kSettingPreviewByKey || id == kSettingEncrypt;
+           id == kSettingPreviewAutomatic || id == kSettingPreviewByKey || id == kSettingEncrypt ||
+           id == kSettingSyncEnabled;
 }
 
 int settingsToggleAtPoint(int tab, int x, int y) {
@@ -9900,6 +10176,8 @@ bool syncSettingsFromControls(HWND hwnd, bool applyEncryption) {
     HWND previewAutomatic = settingsControl(hwnd, kSettingPreviewAutomatic);
     HWND previewByKey = settingsControl(hwnd, kSettingPreviewByKey);
     HWND encrypt = settingsControl(hwnd, kSettingEncrypt);
+    HWND syncEnabled = settingsControl(hwnd, kSettingSyncEnabled);
+    HWND syncServer = settingsControl(hwnd, kSettingSyncServer);
     HWND categoryMax[kStorageCategoryCount]{};
     HWND categoryDisk[kStorageCategoryCount]{};
     for (int i = 0; i < kStorageCategoryCount; ++i) {
@@ -9910,7 +10188,7 @@ bool syncSettingsFromControls(HWND hwnd, bool applyEncryption) {
         !maxContentMb || !dataDirectory || !updateProxy || !ignoredApps || !sensitiveExpiry || !startup ||
         !startupSettings || !startupNotification || !runAsAdministrator ||
          !searchImeCompatibility || !searchOnOpen || !promotePastedItem || !previewAutomatic ||
-         !previewByKey || !encrypt) {
+         !previewByKey || !encrypt || !syncEnabled || !syncServer) {
         return false;
     }
     for (int i = 0; i < kStorageCategoryCount; ++i) {
@@ -10032,6 +10310,22 @@ bool syncSettingsFromControls(HWND hwnd, bool applyEncryption) {
     }
     next.encryptData = desiredEncryption;
 
+    // 同步：开关 + 服务器地址（token 不经 UI 编辑，只能由配对按钮写入）
+    next.syncEnabled = settingsToggleValue(syncEnabled);
+    const int syncServerLength = GetWindowTextLengthW(syncServer);
+    std::wstring syncServerText(static_cast<std::size_t>(syncServerLength) + 1, L'\0');
+    GetWindowTextW(syncServer, syncServerText.data(), syncServerLength + 1);
+    syncServerText.resize(static_cast<std::size_t>(syncServerLength));
+    while (!syncServerText.empty() &&
+           (syncServerText.front() == L' ' || syncServerText.front() == L'\t')) {
+        syncServerText.erase(syncServerText.begin());
+    }
+    while (!syncServerText.empty() &&
+           (syncServerText.back() == L' ' || syncServerText.back() == L'\t')) {
+        syncServerText.pop_back();
+    }
+    next.syncServer = wideToUtf8(syncServerText.c_str(), syncServerText.size());
+
     const bool dataDirectoryChanged = next.dataDirectory != previous.dataDirectory;
     if (dataDirectoryChanged) {
         if (!migrateDataDirectory(hwnd, normalizedDataDirectory, next.dataDirectory)) {
@@ -10062,6 +10356,8 @@ bool syncSettingsFromControls(HWND hwnd, bool applyEncryption) {
     const bool maxContentChanged = next.maxContentMb != previous.maxContentMb;
     const bool categoryLimitsChanged = next.categoryLimits != previous.categoryLimits;
     const bool languageChanged = next.language != previous.language;
+    const bool syncChanged = next.syncEnabled != previous.syncEnabled ||
+        next.syncServer != previous.syncServer;
     const bool changed = winVChanged || startupChanged ||
         startupSettingsChanged || startupNotificationChanged || adminModeChanged || maxItemsChanged ||
         retentionChanged || maxDiskChanged || maxContentChanged || categoryLimitsChanged ||
@@ -10071,11 +10367,15 @@ bool syncSettingsFromControls(HWND hwnd, bool applyEncryption) {
          next.sensitiveExpiryHours != previous.sensitiveExpiryHours || searchImeCompatibilityChanged ||
          searchOnOpenChanged ||
         promotePastedItemChanged || previewChanged || next.updateProxy != previous.updateProxy ||
-        next.ignoredApps != previous.ignoredApps;
+        next.ignoredApps != previous.ignoredApps || syncChanged;
     if (!changed) return true;
 
     g_app->shortcutConflictFeedback.clear();
     g_app->settingsData = std::move(next);
+    if (syncChanged) {
+        applySyncSettings();
+        refreshSyncStatusControl(hwnd);
+    }
     if (promotePastedItemChanged) {
         g_app->store.setSortByLastUsed(g_app->settingsData.promotePastedItem);
     }
@@ -12632,6 +12932,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             invalidatePopupList(hwnd);
             return 0;
         }
+        if (message == kSyncPairResultMessage) {
+            handleSyncPairResult(hwnd);
+            return 0;
+        }
         if (message == WM_TIMER && wParam == kSettingsDropdownTimer) {
             if (!g_app->languageDropdown) {
                 KillTimer(hwnd, kSettingsDropdownTimer);
@@ -12648,6 +12952,14 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 KillTimer(hwnd, kSettingsDropdownTimer);
             } else {
                 positionLanguageDropdown(hwnd, languageDropdownProgress());
+            }
+            return 0;
+        }
+        if (message == WM_TIMER && wParam == kSettingsSyncStateTimer) {
+            if (!g_app->settingsClosing && g_app->settingsTab == kSettingsSyncPage) {
+                refreshSyncStatusControl(hwnd);
+            } else {
+                KillTimer(hwnd, kSettingsSyncStateTimer);
             }
             return 0;
         }
@@ -12847,10 +13159,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 return 0;
             }
             if (x >= ui(8) && x < ui(kSettingsSidebarWidth) &&
-                y >= ui(50) && y < ui(50 + 6 * 38)) {
+                y >= ui(50) && y < ui(50 + 7 * 38)) {
                 if (g_app->settingsTab == kSettingsAppearancePage &&
                     !confirmThemeEditorExit(hwnd)) return 0;
-                g_app->settingsTab = std::clamp((y - ui(50)) / ui(38), 0, 5);
+                g_app->settingsTab = std::clamp((y - ui(50)) / ui(38), 0, 6);
                 g_app->settingsScrollOffset = 0;
                 updateSettingsTabControls(hwnd);
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -12898,6 +13210,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                     LOWORD(wParam) == kSettingUpdateProxy ||
                     LOWORD(wParam) == kSettingIgnoredApps ||
                    LOWORD(wParam) == kSettingSensitiveExpiry ||
+                    LOWORD(wParam) == kSettingSyncServer ||
                     (LOWORD(wParam) >= kSettingCategoryMaxBase &&
                      LOWORD(wParam) < kSettingCategoryDiskBase + kStorageCategoryCount))) {
                 if (g_app->restoringSettingsControls) return 0;
@@ -12915,6 +13228,15 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 animateSettingsToggle(toggle);
                 if (LOWORD(wParam) == kSettingEncrypt) scheduleSettingsEncryptionSync(hwnd);
                 else syncSettingsFromControls(hwnd, false);
+                if (LOWORD(wParam) == kSettingSyncEnabled) refreshSyncStatusControl(hwnd);
+                return 0;
+            }
+            if (LOWORD(wParam) == kSettingSyncPair && HIWORD(wParam) == BN_CLICKED) {
+                handleSyncPairClicked(hwnd);
+                return 0;
+            }
+            if (LOWORD(wParam) == kSettingSyncUnpair && HIWORD(wParam) == BN_CLICKED) {
+                handleSyncUnpairClicked(hwnd);
                 return 0;
             }
             const int actionId = LOWORD(wParam);
@@ -14069,15 +14391,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
             }
         });
     });
-    if (app.settingsData.syncEnabled && !app.settingsData.syncServer.empty() &&
-        !app.settingsData.syncToken.empty()) {
-        clipsync::SyncConfig syncConfig;
-        syncConfig.serverUrl = utf8ToWide(app.settingsData.syncServer);
-        syncConfig.deviceToken = utf8ToWide(app.settingsData.syncToken);
-        app.sync.SetConfig(syncConfig);
-        app.sync.Start();
-        appendDiagnosticLog("INFO", "sync: manager started");
-    }
+    applySyncSettings(); // 统一入口：按 settingsData 决定是否启动同步（含 deviceId）
 
     SetTimer(app.hidden, kExpiryTimer, 60000, nullptr);
     if (!AddClipboardFormatListener(app.hidden)) {

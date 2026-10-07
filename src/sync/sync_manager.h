@@ -86,6 +86,12 @@ public:
     bool PublishMeta(const std::string& kind, const std::string& syncId,
                      std::uint64_t hash, bool pinned);
 
+    // 一次性配对：邀请码 → 设备 token（REST POST /v1/device/join，可在后台线程调用）
+    // 成功返回 true 并填 deviceId/deviceToken；失败时 errorUtf8 携带服务端错误（UTF-8）。
+    static bool DeviceJoin(const std::wstring& serverUrl, const std::string& inviteCode,
+                           const std::string& deviceName, std::string& deviceId,
+                           std::string& deviceToken, std::string& errorUtf8);
+
     SyncState state() const { return state_.load(); }
     std::int64_t lastSeq() const { return lastSeq_.load(); }
 

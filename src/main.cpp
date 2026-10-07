@@ -239,7 +239,7 @@ constexpr UINT kPasteInputTimeoutMs = 500;
 constexpr UINT kTrayId = 1;
 constexpr int kPopupFilterTop = 58;
 constexpr int kPopupFilterBottom = 82;
-constexpr int kPopupSearchLeft = 86;
+constexpr int kPopupSearchLeft = 112;
 constexpr int kPopupSearchRight = 240;
 constexpr int kPopupClearLeft = 244;
 constexpr int kPopupClearRight = 272;
@@ -637,6 +637,7 @@ struct AppState {
     // 房间制配对（协议 v0.3）
     bool syncPairPhaseRequested = false; // true=提交申请待确认（区别于直接配对成功）
     bool syncGenBusy = false;            // 房主：配对码生成中
+    std::chrono::steady_clock::time_point syncGenStartAt{}; // 生成开始时间（卡死保护）
     std::string syncGenCode;             // 房主：最近生成的配对码
     std::string syncGenError;
     std::string syncJoinRequestId;       // 加入方：待确认申请 ID（空=无）
@@ -1288,7 +1289,7 @@ const SettingsLocale kEnglishSettingsLocale{
     L"Appearance and interaction", L"Theme mode", L"Fixed theme", L"System light theme", L"System dark theme", L"Create from current", L"Delete custom theme", L"Language", L"System and integration",
     L"Search input compatibility\nKeep the original app in the foreground; use Ctrl + Space for Chinese IME.",
     L"Pause clipboard monitoring", L"Start with Windows", L"Open settings after startup",
-    L"Show startup notification", L"Run ClipLite as administrator (restart required to disable)",
+    L"Show startup notification", L"Run ClipLiteSync as administrator (restart required to disable)",
     L"Important system shortcut", L"Force replace Win + V", L"Global shortcuts", L"Open clipboard history", L"Open settings",
     L"Pause/resume clipboard monitoring", L"History window shortcuts", L"Paste selected item",
     L"Move pasted item to top", L"Paste as plain text", L"Paste as rich text", L"Close history window",
@@ -1299,9 +1300,9 @@ const SettingsLocale kEnglishSettingsLocale{
     L"Protect history with Windows user encryption",
     L"Changes apply after a short delay and migrate all existing records. Encryption may reduce clipboard and scrolling performance, especially for large images. Encrypted data usually cannot be opened by another Windows user or device.",
     L"Ignored applications (one source name per line)",
-    L"Sensitive content expiry (hours, 0 = off)", L"Protection scope", L"About ClipLite",
-     L"General", L"Appearance", L"Shortcuts", L"Storage", L"Privacy", L"About ClipLite", L"General settings",
-     L"Appearance", L"Shortcuts", L"Storage", L"Privacy", L"About ClipLite", L"Auto-saved",
+    L"Sensitive content expiry (hours, 0 = off)", L"Protection scope", L"About ClipLiteSync",
+     L"General", L"Appearance", L"Shortcuts", L"Storage", L"Privacy", L"About ClipLiteSync", L"General settings",
+     L"Appearance", L"Shortcuts", L"Storage", L"Privacy", L"About ClipLiteSync", L"Auto-saved",
      L"Total history: %zu records, %ls", L"Pinned", L"Records", L"Space",
      L"Current %zu \xB7 %ls",
      L"Set to 0 for unlimited. Pinned records are not removed automatically.",
@@ -1311,10 +1312,10 @@ const SettingsLocale kEnglishSettingsLocale{
      L"Some shortcuts could not be registered. Choose different combinations.",
     L"Custom shortcuts require at least one modifier key.",
     L"Sensitive markers: password, token, api_key, secret, and private keys; detected by content pattern.",
-        L"Application    ClipLite", L"Version        1.4.0 x64", L"Storage format  v4",
+        L"Application    ClipLiteSync", L"Version        1.4.0 x64", L"Storage format  v4",
      L"Data directory  %LOCALAPPDATA%\\ClipLite", L"Browse", L"Clear unpinned history", L"Clear unpinned text",
      L"Clear unpinned images", L"Clear unpinned files", L"Press shortcut", L"Need modifier", L"One application per line", L"Auto",
-    L"ClipLite Settings", L"Choose a valid cache directory.", L"Unable to create the cache directory.",
+    L"ClipLiteSync Settings", L"Choose a valid cache directory.", L"Unable to create the cache directory.",
     L"The target directory already contains history. Choose an empty directory.",
     L"Unable to migrate clipboard history.", L"Unable to open the new cache directory.",
     L"Choose a cache directory", L"Unable to change history encryption.", L"history", L"text", L"images",
@@ -1327,13 +1328,13 @@ const SettingsLocale kEnglishSettingsLocale{
     L"Pin history window", L"Unpin history window", L"Delete", L"Filter", L"Search clipboard history",
     L"Text", L"Image", L"Files", L"Other", L"Just now", L" min ago", L" hr ago", L" d ago",
     L"Open history", L"Settings", L"Exit", L"[Empty]", L"[Image]", L"[Files]", L"[HTML]",
-    L"[Invalid text]", L"ClipLite started", L"ClipLite is running in the system tray.",
-    L"ClipLite startup failed", L"Unable to open clipboard history storage.",
+    L"[Invalid text]", L"ClipLiteSync started", L"ClipLiteSync is running in the system tray.",
+    L"ClipLiteSync startup failed", L"Unable to open clipboard history storage.",
     L"Unable to create the background window.", L"Unable to monitor the clipboard.",
     L"Unable to create the single-instance lock.", L"Log file        ", L"Open log file",
      L"Unable to open the log file.", L"Support the author", L"Join QQ group",
      L"Support ClipLite", L"Thank you for supporting continued development.", L"WeChat Pay",
-     L"Alipay", L"ClipLite QQ group", L"Group: 1081580020", L"Copy group number",
+     L"Alipay", L"ClipLiteSync QQ group", L"Group: 1081580020", L"Copy group number",
      L"Copied", L"Loading image...", L"Unable to load the support image. Check your network connection.",
      L"Automatic preview", L"Preview while holding a key", L"Preview mode", L"Disable preview",
      L"Preview key", L"Loading preview...",
@@ -1353,8 +1354,8 @@ const SettingsLocale kChineseSettingsLocale{
     L"历史记录统计", L"隐私保护", L"使用 Windows 用户加密保护历史",
     L"切换将在短暂延迟后生效，并迁移全部已有记录。开启加密可能降低剪贴板及列表滚动性能，处理大型图片时更明显。加密数据通常无法由其他 Windows 用户或设备解密。",
     L"忽略应用（每行一个来源名称）", L"敏感内容过期时间（小时，0 = 关闭）", L"保护范围",
-     L"关于 ClipLite", L"通用", L"外观", L"快捷键", L"存储管理", L"安全与隐私", L"关于 ClipLite",
-     L"通用设置", L"外观", L"快捷键", L"存储管理", L"安全与隐私", L"关于 ClipLite", L"已自动保存",
+     L"关于 ClipLiteSync", L"通用", L"外观", L"快捷键", L"存储管理", L"安全与隐私", L"关于 ClipLiteSync",
+     L"通用设置", L"外观", L"快捷键", L"存储管理", L"安全与隐私", L"关于 ClipLiteSync", L"已自动保存",
      L"当前历史总计：%zu 条记录，%ls", L"置顶", L"记录", L"空间",
      L"当前 %zu 条 \xB7 %ls", L"设置为 0 表示不限；置顶记录不会被自动清理。",
      L"未检测到快捷键冲突。",
@@ -1362,9 +1363,9 @@ const SettingsLocale kChineseSettingsLocale{
      L"无法注册“%ls”（%ls），可能已被其他程序或 Windows 占用，已恢复为 %ls。",
      L"部分快捷键注册失败，请更换组合键。", L"自定义快捷键至少需要一个修饰键。",
     L"敏感标记：password、token、api_key、secret 和私钥；按内容格式检测。",
-          L"应用名称    ClipLite", L"版本        1.4.0 x64", L"存储格式    v4",
+          L"应用名称    ClipLiteSync", L"版本        1.4.0 x64", L"存储格式    v4",
      L"数据目录    %LOCALAPPDATA%\\ClipLite", L"浏览", L"清理未置顶历史", L"清理未置顶文本", L"清理未置顶图片",
-      L"清理未置顶文件", L"按下组合键", L"需要修饰键", L"每行一个应用名称", L"自动", L"ClipLite 设置",
+      L"清理未置顶文件", L"按下组合键", L"需要修饰键", L"每行一个应用名称", L"自动", L"ClipLiteSync 设置",
     L"请选择有效的缓存目录。", L"无法创建缓存目录。", L"目标目录已有历史数据，请选择空目录。",
     L"无法迁移剪贴板历史。", L"无法打开新的缓存目录。", L"选择缓存目录", L"无法更改历史加密设置。",
       L"历史", L"文本", L"图片", L"文件", L"此操作将永久删除 %zu 条未置顶剪贴板记录，置顶记录会保留，是否继续？",
@@ -1376,11 +1377,11 @@ const SettingsLocale kChineseSettingsLocale{
     L"置顶历史窗口", L"取消历史窗口置顶", L"删除", L"筛选", L"搜索剪贴板历史",
     L"文本", L"图片", L"文件", L"其他", L"刚刚", L"分钟前", L"小时前", L"天前",
     L"打开历史", L"设置", L"退出", L"[空]", L"[图片]", L"[文件]", L"[HTML]", L"[无效文本]",
-    L"ClipLite 已启动", L"ClipLite 正在系统托盘中运行。", L"ClipLite 启动失败",
+    L"ClipLiteSync 已启动", L"ClipLiteSync 正在系统托盘中运行。", L"ClipLiteSync 启动失败",
     L"无法打开剪贴板历史存储。", L"无法创建后台窗口。", L"无法监听剪贴板。",
      L"无法创建单实例锁。", L"日志文件        ", L"打开日志文件", L"无法打开日志文件。",
-     L"支持作者", L"加入 QQ 群", L"支持 ClipLite", L"感谢你支持项目持续开发。", L"微信支付",
-     L"支付宝", L"ClipLite QQ 群", L"群号：1081580020", L"复制群号", L"已复制", L"正在加载图片...",
+     L"支持作者", L"加入 QQ 群", L"支持 ClipLiteSync", L"感谢你支持项目持续开发。", L"微信支付",
+     L"支付宝", L"ClipLiteSync QQ 群", L"群号：1081580020", L"复制群号", L"已复制", L"正在加载图片...",
       L"无法加载支持图片，请检查网络连接。", L"自动预览", L"按住按键预览", L"预览模式", L"关闭预览",
       L"预览按键",
        L"正在加载预览...", L"无法加载预览。", L"未选择记录", L"此记录受保护。", L"原图", L"内容预览",
@@ -1799,7 +1800,18 @@ void handleSyncGenCodeClicked(HWND hwnd) {
     std::string token;
     {
         std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
-        if (g_app->syncGenBusy) return;
+        if (g_app->syncGenBusy) {
+            // 卡死保护：超过 20 秒仍 busy 视为上次结果丢失（如窗口中途销毁），允许重试
+            if (std::chrono::steady_clock::now() - g_app->syncGenStartAt <
+                std::chrono::seconds(20)) {
+                setSettingsActionFeedback(hwnd,
+                    tr(L"Generating pair code, please wait a moment…",
+                       L"正在生成配对码，请稍候…"), true);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return;
+            }
+            g_app->syncGenBusy = false;
+        }
         token = g_app->settingsData.syncToken;
     }
     if (token.empty()) {
@@ -1816,10 +1828,13 @@ void handleSyncGenCodeClicked(HWND hwnd) {
     {
         std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
         g_app->syncGenBusy = true;
+        g_app->syncGenStartAt = std::chrono::steady_clock::now();
     }
     if (HWND box = settingsControl(hwnd, kSettingSyncCodeBox)) {
         SetWindowTextW(box, tr(L"...", L"..."));
     }
+    setSettingsActionFeedback(hwnd,
+        tr(L"Generating pair code…", L"正在生成配对码…"), true);
     const HWND settingsWindow = hwnd;
     std::thread([settingsWindow, server, token] {
         std::string code;
@@ -2122,7 +2137,7 @@ void handleSyncKickClicked(HWND hwnd, std::size_t index) {
     const std::wstring confirm = tr(L"Remove \"", L"确定移除 \"") + utf8ToWide(name) +
         tr(L"\" from this room? Its pairing will be revoked and it will stop syncing.",
            L"\"？其配对将被吊销并立即停止同步。");
-    if (MessageBoxW(hwnd, confirm.c_str(), L"ClipLite",
+    if (MessageBoxW(hwnd, confirm.c_str(), L"ClipLiteSync",
                     MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
         return;
     }
@@ -2288,7 +2303,7 @@ void handleSyncUnpairClicked(HWND hwnd) {
     if (MessageBoxW(hwnd,
                     tr(L"Clear pairing on this device and stop syncing?",
                        L"确定清除本机配对并停止同步？"),
-                    L"ClipLite", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                    L"ClipLiteSync", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
         return;
     }
     g_app->settingsData.syncToken.clear();
@@ -3538,7 +3553,7 @@ int popupFilterAt(int x, int y) {
 }
 
 bool popupPointInHeader(const RECT& client, int x, int y) {
-    return y >= ui(12) && y < ui(46) && x >= ui(16) && x < ui(84) &&
+    return y >= ui(12) && y < ui(46) && x >= ui(16) && x < ui(104) &&
            x < client.right - ui(54);
 }
 
@@ -6276,7 +6291,7 @@ void showPopup(bool openedByWinV = false) {
     y = std::max(y, static_cast<int>(info.rcWork.top));
     g_app->popup = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
                                    L"ClipLitePopup",
-                                   L"ClipLite", WS_POPUP | WS_CLIPCHILDREN, x, y, width, height,
+                                   L"ClipLiteSync", WS_POPUP | WS_CLIPCHILDREN, x, y, width, height,
                                    nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!g_app->popup) {
         g_app->popupOpening = false;
@@ -6445,7 +6460,7 @@ bool addTrayIcon() {
     icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     icon.uCallbackMessage = kTrayMessage;
     icon.hIcon = clipLiteIcon();
-    wcscpy_s(icon.szTip, L"ClipLite");
+    wcscpy_s(icon.szTip, L"ClipLiteSync");
     return Shell_NotifyIconW(NIM_ADD, &icon) != FALSE;
 }
 
@@ -7580,7 +7595,7 @@ void registerHotkeys() {
                 kHotkeyWinV, ShortcutBinding{MOD_WIN, 'V'});
             if (!g_app->winVHotkeyRegistered) {
                 MessageBoxW(g_app->hidden, tr(L"Unable to replace Win+V.", L"无法替换 Win+V。"),
-                            L"ClipLite", MB_OK | MB_ICONWARNING);
+                            L"ClipLiteSync", MB_OK | MB_ICONWARNING);
                 g_app->settingsData.winV = false;
                 saveSettings(g_app->settingsData);
             } else {
@@ -8082,7 +8097,7 @@ SettingsLayout buildSettingsLayout(HWND hwnd) {
                             tr(L"How to: click \"Generate pair code\" on the other device, "
                                L"enter the 8-character code above, then click Join. The other "
                                L"device must approve before syncing starts.",
-                               L"操作：在对方设备的「邀请设备加入本房间」里点「生成配对码」，"
+                               L"操作：在对方设备的「邀请设备加入」里点「生成配对码」，"
                                L"把 8 位码填到上面后点「加入」；对方确认后才完成配对。"),
                             {}, {}, {}, contentWidth)
         });
@@ -8108,7 +8123,7 @@ SettingsLayout buildSettingsLayout(HWND hwnd) {
                    L"list below for you to approve or reject.",
                    L"配对码 10 分钟内有效、一次性使用。对方填码申请后会出现在下方待确认列表，由你决定允许或拒绝。"),
                 {}, {}, {}, contentWidth));
-            makeCard(tr(L"Invite devices to this room", L"邀请设备加入本房间"), std::move(rows));
+            makeCard(tr(L"Invite devices", L"邀请设备加入"), std::move(rows));
         }
         {
             std::vector<SettingsRowLayout> rows;
@@ -8401,7 +8416,7 @@ void paintSettingsContent(HWND hwnd, HDC dc, bool bodyOnly = false) {
     SelectObject(dc, navFont);
     SetTextColor(dc, secondary);
     RECT menuTitle{ui(24), ui(22), ui(156), ui(42)};
-    DrawTextW(dc, L"ClipLite", -1, &menuTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextW(dc, L"ClipLiteSync", -1, &menuTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     for (int i = 0; i < 7; ++i) {
         const int top = 54 + i * 38;
         const bool active = i == g_app->settingsTab;
@@ -8822,12 +8837,12 @@ void paintPopupContent(HWND hwnd, HDC dc) {
     const int paintClipType = GetClipBox(dc, &paintClip);
     HGDIOBJ old = SelectObject(dc, titleFont);
     SetTextColor(dc, text);
-    RECT titleRect{ui(12), ui(10), ui(86), ui(50)};
+    RECT titleRect{ui(12), ui(10), ui(kPopupSearchLeft) - ui(8), ui(50)};
     if (g_app->hoveredHeader) {
-        drawGdiRoundedSurface(dc, RECT{ui(12), ui(10), ui(86), ui(50)},
+        drawGdiRoundedSurface(dc, RECT{ui(12), ui(10), ui(kPopupSearchLeft) - ui(8), ui(50)},
                               settingsAccentSoftColor(), settingsAccentSoftColor(), 4);
     }
-    DrawTextW(dc, L"ClipLite", -1, &titleRect,
+    DrawTextW(dc, L"ClipLiteSync", -1, &titleRect,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     const COLORREF searchBorder = g_app->searchEdit && g_app->popupSearchInputActive
         ? accent : border;
@@ -10809,14 +10824,14 @@ bool migrateDataDirectory(HWND hwnd, const std::wstring& requested, std::string&
     if (targetDirectory.empty()) {
         appendDiagnosticLog("ERROR", "settings: invalid cache directory");
         MessageBoxW(hwnd, settingsLocale().chooseValidCache,
-                    L"ClipLite", MB_OK | MB_ICONWARNING);
+                    L"ClipLiteSync", MB_OK | MB_ICONWARNING);
         return false;
     }
     if (SHCreateDirectoryExW(nullptr, targetDirectory.c_str(), nullptr) != ERROR_SUCCESS &&
         GetLastError() != ERROR_ALREADY_EXISTS) {
         appendDiagnosticLog("ERROR", "settings: unable to create cache directory", GetLastError());
         MessageBoxW(hwnd, settingsLocale().unableCreateCache,
-                    L"ClipLite", MB_OK | MB_ICONWARNING);
+                    L"ClipLiteSync", MB_OK | MB_ICONWARNING);
         return false;
     }
 
@@ -10835,7 +10850,7 @@ bool migrateDataDirectory(HWND hwnd, const std::wstring& requested, std::string&
         appendDiagnosticLog("WARN", "settings: cache migration target already contains history");
         MessageBoxW(hwnd,
                     settingsLocale().targetContainsHistory,
-                    L"ClipLite", MB_OK | MB_ICONWARNING);
+                    L"ClipLiteSync", MB_OK | MB_ICONWARNING);
         return false;
     }
 
@@ -10845,7 +10860,7 @@ bool migrateDataDirectory(HWND hwnd, const std::wstring& requested, std::string&
             appendDiagnosticLog("ERROR", "settings: unable to copy history during cache migration",
                                 GetLastError());
             MessageBoxW(hwnd, settingsLocale().unableMigrateHistory,
-                        L"ClipLite", MB_OK | MB_ICONWARNING);
+                        L"ClipLiteSync", MB_OK | MB_ICONWARNING);
             return false;
         }
         copied = true;
@@ -10856,7 +10871,7 @@ bool migrateDataDirectory(HWND hwnd, const std::wstring& requested, std::string&
         g_app->store.setDataDirectory(currentDirectory);
         g_app->store.open();
         MessageBoxW(hwnd, settingsLocale().unableOpenCache,
-                    L"ClipLite", MB_OK | MB_ICONWARNING);
+                    L"ClipLiteSync", MB_OK | MB_ICONWARNING);
         return false;
     }
     g_app->thumbnailCache.moveDirectory(currentDirectory, targetDirectory);
@@ -11012,7 +11027,7 @@ bool syncSettingsFromControls(HWND hwnd, bool applyEncryption) {
     const std::wstring normalizedDataDirectory = normalizeDataDirectory(dataDirectoryText);
     if (!dataDirectoryText.empty() && normalizedDataDirectory.empty()) {
         MessageBoxW(hwnd, settingsLocale().chooseValidCache,
-                    L"ClipLite", MB_OK | MB_ICONWARNING);
+                    L"ClipLiteSync", MB_OK | MB_ICONWARNING);
         return false;
     }
     const std::wstring defaultDataDirectory = normalizeDataDirectory(clipLiteDataDirectory());
@@ -11091,7 +11106,7 @@ bool syncSettingsFromControls(HWND hwnd, bool applyEncryption) {
         appendDiagnosticLog("ERROR", "settings: history encryption migration failed");
         setSettingsToggleValue(encrypt, previousEncryption);
         MessageBoxW(hwnd, settingsLocale().unableChangeEncryption,
-                    L"ClipLite", MB_OK | MB_ICONWARNING);
+                    L"ClipLiteSync", MB_OK | MB_ICONWARNING);
         return false;
     }
     next.encryptData = desiredEncryption;
@@ -11219,7 +11234,7 @@ bool syncSettingsFromControls(HWND hwnd, bool applyEncryption) {
             saveSettings(g_app->settingsData);
             MessageBoxW(hwnd, tr(L"Unable to restart ClipLite with administrator rights.",
                                   L"无法以管理员权限重新启动 ClipLite。"),
-                        L"ClipLite", MB_OK | MB_ICONWARNING);
+                        L"ClipLiteSync", MB_OK | MB_ICONWARNING);
             return false;
         }
         if (!processIsElevated()) PostQuitMessage(0);
@@ -11739,7 +11754,12 @@ void setSettingsActionFeedback(HWND hwnd, const std::wstring& message, bool succ
         // 同步页反馈画在标题下方的固定条带（内容区内），回滚到页顶避免被滚动内容盖住
         g_app->settingsScrollOffset = 0;
     }
-    SetTimer(hwnd, kSettingsActionFeedbackTimer, kSettingsActionFeedbackMs, nullptr);
+    if (success) {
+        SetTimer(hwnd, kSettingsActionFeedbackTimer, kSettingsActionFeedbackMs, nullptr);
+    } else {
+        // 错误提示常驻，直到下一次操作覆盖，避免用户来不及看到
+        KillTimer(hwnd, kSettingsActionFeedbackTimer);
+    }
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
@@ -12383,6 +12403,8 @@ void configureSettingsEdit(HWND hwnd) {
         textLimit = 2;
     } else if (id == kSettingSensitiveExpiry) {
         textLimit = 3;
+    } else if (id == kSettingSyncInvite) {
+        textLimit = 8;  // 配对码固定 8 位
     } else if (id == kSettingThemeName) {
         textLimit = 48;
     }
@@ -14756,7 +14778,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 return 0;
             }
             if (GET_Y_LPARAM(lParam) >= ui(12) && GET_Y_LPARAM(lParam) < ui(46) &&
-                GET_X_LPARAM(lParam) >= ui(16) && GET_X_LPARAM(lParam) < ui(84)) {
+                GET_X_LPARAM(lParam) >= ui(16) && GET_X_LPARAM(lParam) < ui(104)) {
                 ReleaseCapture();
                 SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
                 return 0;

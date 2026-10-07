@@ -455,16 +455,17 @@ std::string SyncManager::buildEventJson(const SyncEvent& e) {
     return os.str();
 }
 
-// ---------- 一次性配对（REST，独立于 WS 数据面） ----------
+// ---------- 房间制配对（REST，独立于 WS 数据面） ----------
 
-bool SyncManager::DeviceJoin(const std::wstring& serverUrl, const std::string& inviteCode,
-                             const std::string& deviceName, std::string& deviceId,
-                             std::string& deviceToken, std::string& errorUtf8) {
+bool SyncManager::restCall(const std::wstring& serverUrl, const wchar_t* method, const wchar_t* path,
+                           const std::string& bodyJson, const std::string& bearer,
+                           int& status, std::string& response, std::string& errorUtf8) {
+    status = 0;
     std::wstring host;
     int port = 0;
     bool secure = false;
-    std::wstring path;
-    if (!parseUrl(serverUrl, host, port, secure, path)) {
+    std::wstring pathBase;
+    if (!parseUrl(serverUrl, host, port, secure, pathBase)) {
         errorUtf8 = "服务器地址无效（需 ws:// 或 wss://）";
         return false;
     }
@@ -479,7 +480,7 @@ bool SyncManager::DeviceJoin(const std::wstring& serverUrl, const std::string& i
     const HINTERNET connection = WinHttpConnect(session, host.c_str(),
                                                 static_cast<INTERNET_PORT>(port), 0);
     const HINTERNET request = connection
-        ? WinHttpOpenRequest(connection, L"POST", L"/v1/device/join", nullptr,
+        ? WinHttpOpenRequest(connection, method, path, nullptr,
                              WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                              secure ? WINHTTP_FLAG_SECURE : 0)
         : nullptr;
@@ -492,40 +493,35 @@ bool SyncManager::DeviceJoin(const std::wstring& serverUrl, const std::string& i
             WinHttpSetOption(request, WINHTTP_OPTION_SECURITY_FLAGS,
                              &flags, sizeof(flags));
         }
-        const std::string body = "{\"inviteCode\":\"" + jsonEscape(inviteCode) +
-                                 "\",\"deviceName\":\"" + jsonEscape(deviceName) + "\"}";
-        const wchar_t* headers = L"Content-Type: application/json\r\n";
-        if (WinHttpSendRequest(request, headers, static_cast<DWORD>(wcslen(headers)),
-                               reinterpret_cast<LPVOID>(const_cast<char*>(body.data())),
-                               static_cast<DWORD>(body.size()),
-                               static_cast<DWORD>(body.size()), 0) &&
+        std::wstring headers;
+        if (!bearer.empty()) {
+            headers += L"Authorization: Bearer ";
+            headers += std::wstring(bearer.begin(), bearer.end());
+            headers += L"\r\n";
+        }
+        const void* bodyData = nullptr;
+        DWORD bodySize = 0;
+        if (!bodyJson.empty()) {
+            headers += L"Content-Type: application/json\r\n";
+            bodyData = bodyJson.data();
+            bodySize = static_cast<DWORD>(bodyJson.size());
+        }
+        if (WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(headers.size()),
+                               const_cast<LPVOID>(bodyData), bodySize, bodySize, 0) &&
             WinHttpReceiveResponse(request, nullptr)) {
-            DWORD status = 0;
-            DWORD size = sizeof(status);
+            DWORD statusRaw = 0;
+            DWORD size = sizeof(statusRaw);
             WinHttpQueryHeaders(request,
                                 WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
-            std::string response;
+                                WINHTTP_HEADER_NAME_BY_INDEX, &statusRaw, &size, WINHTTP_NO_HEADER_INDEX);
+            status = static_cast<int>(statusRaw);
             for (;;) {
                 char buffer[4096];
                 DWORD read = 0;
                 if (!WinHttpReadData(request, buffer, sizeof(buffer), &read) || read == 0) break;
                 response.append(buffer, read);
             }
-            JValue json;
-            if (parseJson(response, json) && json.isObject()) {
-                if (status == 200) {
-                    deviceId = json.at("deviceId").asString();
-                    deviceToken = json.at("deviceToken").asString();
-                    ok = !deviceId.empty() && !deviceToken.empty();
-                    if (!ok) errorUtf8 = "服务端响应缺少字段";
-                } else {
-                    errorUtf8 = json.at("error").asString();
-                    if (errorUtf8.empty()) errorUtf8 = "配对失败（HTTP " + std::to_string(status) + "）";
-                }
-            } else {
-                errorUtf8 = "服务端响应解析失败";
-            }
+            ok = true;
         } else {
             errorUtf8 = "无法连接服务器";
         }
@@ -536,6 +532,171 @@ bool SyncManager::DeviceJoin(const std::wstring& serverUrl, const std::string& i
     if (connection) WinHttpCloseHandle(connection);
     WinHttpCloseHandle(session);
     return ok;
+}
+
+// 从错误响应提取 error 字段；没有就给 HTTP 状态描述
+namespace {
+std::string errorFromResponse(int status, const std::string& response) {
+    JValue json;
+    if (parseJson(response, json) && json.isObject()) {
+        std::string err = json.at("error").asString();
+        if (!err.empty()) return err;
+    }
+    return "请求失败（HTTP " + std::to_string(status) + "）";
+}
+} // namespace
+
+bool SyncManager::DeviceInvite(const std::wstring& serverUrl, const std::string& deviceToken,
+                               std::string& code, std::int64_t& expiresAtMs, std::string& errorUtf8) {
+    int status = 0;
+    std::string response;
+    if (!restCall(serverUrl, L"POST", L"/v1/device/invite", "{}", deviceToken,
+                  status, response, errorUtf8)) {
+        return false;
+    }
+    JValue json;
+    if (!parseJson(response, json) || !json.isObject()) {
+        errorUtf8 = "服务端响应解析失败";
+        return false;
+    }
+    if (status != 200) {
+        errorUtf8 = errorFromResponse(status, response);
+        return false;
+    }
+    code = json.at("code").asString();
+    expiresAtMs = json.at("expiresAt").asInt();
+    if (code.empty()) {
+        errorUtf8 = "服务端响应缺少字段";
+        return false;
+    }
+    return true;
+}
+
+bool SyncManager::DeviceJoinRequest(const std::wstring& serverUrl, const std::string& code,
+                                    const std::string& deviceName, JoinPhase& phase,
+                                    std::string& requestId, std::string& deviceId,
+                                    std::string& deviceToken, std::string& errorUtf8) {
+    phase = JoinPhase::Requested;
+    const std::string body = "{\"inviteCode\":\"" + jsonEscape(code) +
+                             "\",\"deviceName\":\"" + jsonEscape(deviceName) + "\"}";
+    int status = 0;
+    std::string response;
+    if (!restCall(serverUrl, L"POST", L"/v1/device/join", body, {},
+                  status, response, errorUtf8)) {
+        return false;
+    }
+    JValue json;
+    if (!parseJson(response, json) || !json.isObject()) {
+        errorUtf8 = "服务端响应解析失败";
+        return false;
+    }
+    if (status != 200) {
+        errorUtf8 = errorFromResponse(status, response);
+        return false;
+    }
+    const std::string result = json.at("status").asString();
+    if (result == "approved") {
+        phase = JoinPhase::Approved;
+        deviceId = json.at("deviceId").asString();
+        deviceToken = json.at("deviceToken").asString();
+        if (deviceId.empty() || deviceToken.empty()) {
+            errorUtf8 = "服务端响应缺少字段";
+            return false;
+        }
+        return true;
+    }
+    if (result == "pending") {
+        phase = JoinPhase::Requested;
+        requestId = json.at("requestId").asString();
+        if (requestId.empty()) {
+            errorUtf8 = "服务端响应缺少字段";
+            return false;
+        }
+        return true;
+    }
+    errorUtf8 = "服务端返回未知状态：" + result;
+    return false;
+}
+
+bool SyncManager::DeviceJoinPoll(const std::wstring& serverUrl, const std::string& requestId,
+                                 JoinPhase& phase, std::string& deviceId,
+                                 std::string& deviceToken, std::string& errorUtf8) {
+    phase = JoinPhase::Requested;
+    const std::wstring path = std::wstring(L"/v1/device/join/status?requestId=") +
+                              std::wstring(requestId.begin(), requestId.end());
+    int status = 0;
+    std::string response;
+    if (!restCall(serverUrl, L"GET", path.c_str(), {}, {}, status, response, errorUtf8)) {
+        return false;
+    }
+    JValue json;
+    if (!parseJson(response, json) || !json.isObject()) {
+        errorUtf8 = "服务端响应解析失败";
+        return false;
+    }
+    const std::string result = json.at("status").asString();
+    if (result == "approved") {
+        phase = JoinPhase::Approved;
+        deviceId = json.at("deviceId").asString();
+        deviceToken = json.at("deviceToken").asString();
+        return !deviceId.empty() && !deviceToken.empty();
+    }
+    if (result == "rejected") phase = JoinPhase::Rejected;
+    else if (result == "expired") phase = JoinPhase::Expired;
+    else if (result == "not_found") phase = JoinPhase::NotFound;
+    else phase = JoinPhase::Requested; // pending
+    return true;
+}
+
+bool SyncManager::DevicePendingList(const std::wstring& serverUrl, const std::string& deviceToken,
+                                    std::vector<PendingJoinInfo>& out, std::string& errorUtf8) {
+    out.clear();
+    int status = 0;
+    std::string response;
+    if (!restCall(serverUrl, L"GET", L"/v1/device/pending", {}, deviceToken,
+                  status, response, errorUtf8)) {
+        return false;
+    }
+    JValue json;
+    if (!parseJson(response, json) || !json.isObject()) {
+        errorUtf8 = "服务端响应解析失败";
+        return false;
+    }
+    if (status != 200) {
+        errorUtf8 = errorFromResponse(status, response);
+        return false;
+    }
+    const JValue& list = json.at("pending");
+    if (!list.isArray()) {
+        errorUtf8 = "服务端响应缺少字段";
+        return false;
+    }
+    for (const JValue& item : list.arr) {
+        PendingJoinInfo info;
+        info.requestId = item.at("requestId").asString();
+        info.deviceName = item.at("deviceName").asString();
+        info.createdAt = item.at("createdAt").asInt();
+        if (!info.requestId.empty()) out.push_back(std::move(info));
+    }
+    return true;
+}
+
+bool SyncManager::DevicePendingDecide(const std::wstring& serverUrl, const std::string& deviceToken,
+                                      const std::string& requestId, bool approve,
+                                      std::string& errorUtf8) {
+    const std::string body = "{\"requestId\":\"" + jsonEscape(requestId) +
+                             "\",\"approve\":" + (approve ? "true" : "false") + "}";
+    int status = 0;
+    std::string response;
+    if (!restCall(serverUrl, L"POST", L"/v1/device/pending/decide", body, deviceToken,
+                  status, response, errorUtf8)) {
+        return false;
+    }
+    if (status != 200) {
+        errorUtf8 = errorFromResponse(status, response);
+        return false;
+    }
+    return true;
 }
 
 } // namespace clipsync

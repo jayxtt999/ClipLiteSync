@@ -22,7 +22,7 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{cfg: cfg, devices: devices, invites: NewInviteStore(), admin: &AdminTokens{tokens: map[string]bool{}}, hub: NewHub(cfg)}
+	s := &Server{cfg: cfg, devices: devices, invites: NewInviteStore(), pending: NewPendingStore(), joinGuard: NewJoinGuard(), admin: &AdminTokens{tokens: map[string]bool{}}, hub: NewHub(cfg)}
 	ts := httptest.NewServer(httpHandler(s))
 	t.Cleanup(ts.Close)
 	return s, ts
@@ -141,10 +141,11 @@ func TestAdminLoginAndInviteFlow(t *testing.T) {
 	}
 	var inv map[string]string
 	json.Unmarshal(body, &inv)
-	if len(inv["inviteCode"]) != 6 {
-		t.Fatalf("邀请码应为 6 位: %q", inv["inviteCode"])
+	if len(inv["inviteCode"]) != 8 {
+		t.Fatalf("配对码应为 8 位: %q", inv["inviteCode"])
 	}
 
+	// 创始码（管理员生成）：直接放行，返回 token
 	joinBody, _ := json.Marshal(map[string]string{"inviteCode": inv["inviteCode"], "deviceName": "pc-A"})
 	code, body = httpPost(t, ts.URL+"/v1/device/join", joinBody, "")
 	if code != 200 {

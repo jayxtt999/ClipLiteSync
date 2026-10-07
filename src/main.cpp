@@ -140,6 +140,11 @@ constexpr int kSettingSyncInvite = 82;
 constexpr int kSettingSyncPair = 83;
 constexpr int kSettingSyncUnpair = 84;
 constexpr int kSettingSyncStatus = 85;
+constexpr int kSettingSyncGenCode = 86;  // 生成配对码（房主）
+constexpr int kSettingSyncCodeBox = 87;  // 配对码展示（只读）
+constexpr int kSettingSyncApprove = 88;  // 允许加入
+constexpr int kSettingSyncReject = 89;   // 拒绝加入
+constexpr int kSettingSyncPending = 90;  // 待确认设备展示（只读）
 constexpr int kSettingThemeColorBase = 100;
 constexpr int kSettingThemeSwatchBase = 120;
 constexpr std::array<std::size_t, 14> kEditableThemeColorIndices = {
@@ -187,6 +192,9 @@ constexpr UINT kStoreChangedMessage = WM_APP + 15;
 constexpr UINT kPastePayloadLoadedMessage = WM_APP + 16;
 constexpr UINT kUpdateCheckCompleteMessage = WM_APP + 17;
 constexpr UINT kSyncPairResultMessage = WM_APP + 18;
+constexpr UINT kSyncGenCodeResultMessage = WM_APP + 19;   // 配对码生成结果
+constexpr UINT kSyncJoinPollResultMessage = WM_APP + 20;  // 加入申请轮询结果
+constexpr UINT kSyncPendingResultMessage = WM_APP + 21;   // 待确认列表刷新
 constexpr UINT_PTR kExpiryTimer = 3;
 constexpr UINT_PTR kClipboardCaptureTimer = 7;
 constexpr UINT_PTR kSettingsToggleTimer = 4;
@@ -622,6 +630,29 @@ struct AppState {
     std::string syncPairToken;
     std::string syncPairDeviceId;
     std::string syncPairError;
+    // 房间制配对（协议 v0.3）
+    bool syncPairPhaseRequested = false; // true=提交申请待确认（区别于直接配对成功）
+    bool syncGenBusy = false;            // 房主：配对码生成中
+    std::string syncGenCode;             // 房主：最近生成的配对码
+    std::string syncGenError;
+    std::string syncJoinRequestId;       // 加入方：待确认申请 ID（空=无）
+    bool syncJoinPollBusy = false;       // 加入方：轮询进行中
+    bool syncJoinPollHas = false;        // 加入方：轮询结果就绪
+    bool syncJoinPollOk = false;
+    int syncJoinPollPhase = 0;           // 0 pending 1 approved 2 rejected 3 expired 4 not_found
+    std::string syncJoinPollToken;
+    std::string syncJoinPollDeviceId;
+    std::string syncJoinPollError;
+    std::mutex syncPendingMutex;         // 房主：待确认列表
+    bool syncPendingBusy = false;
+    bool syncPendingHas = false;
+    bool syncPendingOk = false;
+    std::string syncPendingError;
+    std::vector<clipsync::SyncManager::PendingJoinInfo> syncPendingList;
+    bool syncDecideDone = false;         // 本次刷新来自 允许/拒绝 操作，需要反馈
+    bool syncDecideApproved = false;
+    std::string syncDecideName;
+    UINT syncPollTick = 0;               // 轮询节流（每 2 秒一次）
     int benchmarkExitCode = 0;
     std::uint64_t ignoredClipboardHash = 0;
     std::uint64_t ignoredClipboardTextHash = 0;
@@ -1566,7 +1597,8 @@ std::string syncTrimmedUtf8(HWND control) {
     return wideToUtf8(text.c_str(), text.size());
 }
 
-// "配对"按钮：邀请码 → 设备 token（后台线程发起 REST 请求，不阻塞 UI）
+// "加入"按钮：填配对码 → 提交申请（后台线程发起 REST，不阻塞 UI）
+// 创始码（管理员生成）直接返回 token；设备生成的码进入待确认，由房主放行。
 void handleSyncPairClicked(HWND hwnd) {
     if (!g_app || !hwnd) return;
     {
@@ -1579,10 +1611,10 @@ void handleSyncPairClicked(HWND hwnd) {
         }
     }
     const std::string server = syncTrimmedUtf8(settingsControl(hwnd, kSettingSyncServer));
-    const std::string invite = syncTrimmedUtf8(settingsControl(hwnd, kSettingSyncInvite));
-    if (server.empty() || invite.empty()) {
+    const std::string code = syncTrimmedUtf8(settingsControl(hwnd, kSettingSyncInvite));
+    if (server.empty() || code.empty()) {
         setSettingsActionFeedback(hwnd,
-            tr(L"Enter the server address and invite code first.", L"请先填写服务器地址和邀请码。"),
+            tr(L"Enter the server address and pair code first.", L"请先填写服务器地址和配对码。"),
             false);
         InvalidateRect(hwnd, nullptr, FALSE);
         return;
@@ -1602,22 +1634,27 @@ void handleSyncPairClicked(HWND hwnd) {
         g_app->syncPairBusy = true;
     }
     if (HWND status = settingsControl(hwnd, kSettingSyncStatus)) {
-        SetWindowTextW(status, tr(L"Pairing...", L"配对中..."));
+        SetWindowTextW(status, tr(L"Submitting join request...", L"正在提交加入申请..."));
     }
     const HWND settingsWindow = hwnd;
-    std::thread([settingsWindow, server, invite, deviceName] {
+    std::thread([settingsWindow, server, code, deviceName] {
+        using clipsync::SyncManager;
+        SyncManager::JoinPhase phase = SyncManager::JoinPhase::Requested;
+        std::string requestId;
         std::string deviceId;
         std::string token;
         std::string error;
-        const bool ok = clipsync::SyncManager::DeviceJoin(utf8ToWide(server), invite,
-                                                          deviceName, deviceId, token, error);
+        const bool ok = SyncManager::DeviceJoinRequest(utf8ToWide(server), code, deviceName,
+                                                       phase, requestId, deviceId, token, error);
         appendDiagnosticLog(ok ? "INFO" : "WARN",
                             ok ? "sync: pair join ok" : "sync: pair join failed");
         if (g_app) {
             std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
             g_app->syncPairOk = ok;
-            g_app->syncPairToken = ok ? token : std::string();
-            g_app->syncPairDeviceId = ok ? deviceId : std::string();
+            g_app->syncPairPhaseRequested = ok && phase == SyncManager::JoinPhase::Requested;
+            g_app->syncJoinRequestId = ok ? requestId : std::string();
+            g_app->syncPairToken = (ok && phase == SyncManager::JoinPhase::Approved) ? token : std::string();
+            g_app->syncPairDeviceId = (ok && phase == SyncManager::JoinPhase::Approved) ? deviceId : std::string();
             g_app->syncPairError = ok ? std::string() : error;
             g_app->syncPairBusy = false;
         }
@@ -1629,15 +1666,26 @@ void handleSyncPairClicked(HWND hwnd) {
 void handleSyncPairResult(HWND hwnd) {
     if (!g_app || !hwnd) return;
     bool ok = false;
+    bool requested = false;
     std::string token;
     std::string deviceId;
     std::string error;
     {
         std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
         ok = g_app->syncPairOk;
+        requested = g_app->syncPairPhaseRequested;
         token = g_app->syncPairToken;
         deviceId = g_app->syncPairDeviceId;
         error = g_app->syncPairError;
+    }
+    if (ok && requested) {
+        // 已提交申请，等待房主确认（轮询在 kSettingsSyncStateTimer 中进行）
+        refreshSyncStatusControl(hwnd);
+        setSettingsActionFeedback(hwnd,
+            tr(L"Request submitted. Waiting for the other device to approve...",
+               L"申请已提交，等待对方设备确认..."), true);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
     }
     if (ok) {
         g_app->settingsData.syncToken = token;
@@ -1662,6 +1710,305 @@ void handleSyncPairResult(HWND hwnd) {
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
+// 生成配对码（房主，后台线程）
+void handleSyncGenCodeClicked(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        if (g_app->syncGenBusy) return;
+        token = g_app->settingsData.syncToken;
+    }
+    if (token.empty()) {
+        setSettingsActionFeedback(hwnd,
+            tr(L"Pair this device first to generate a pair code.",
+               L"请先完成本机配对，才能生成配对码。"), false);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+    const std::string server = g_app->settingsData.syncServer;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        g_app->syncGenBusy = true;
+    }
+    if (HWND box = settingsControl(hwnd, kSettingSyncCodeBox)) {
+        SetWindowTextW(box, tr(L"...", L"..."));
+    }
+    const HWND settingsWindow = hwnd;
+    std::thread([settingsWindow, server, token] {
+        std::string code;
+        std::int64_t expiresAt = 0;
+        std::string error;
+        const bool ok = clipsync::SyncManager::DeviceInvite(utf8ToWide(server), token,
+                                                            code, expiresAt, error);
+        if (g_app) {
+            std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+            g_app->syncGenCode = ok ? code : std::string();
+            g_app->syncGenError = ok ? std::string() : error;
+            g_app->syncGenBusy = false;
+        }
+        PostMessageW(settingsWindow, kSyncGenCodeResultMessage, 0, 0);
+    }).detach();
+}
+
+// 配对码生成结果（UI 线程）
+void handleSyncGenCodeResult(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    bool ok = false;
+    std::string code;
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        ok = !g_app->syncGenCode.empty();
+        code = g_app->syncGenCode;
+        error = g_app->syncGenError;
+    }
+    if (HWND box = settingsControl(hwnd, kSettingSyncCodeBox)) {
+        SetWindowTextW(box, ok ? utf8ToWide(code).c_str()
+                               : tr(L"Failed", L"生成失败"));
+    }
+    if (ok) {
+        setSettingsActionFeedback(hwnd,
+            tr(L"Pair code generated. Valid for 10 minutes, one-time use.",
+               L"配对码已生成：10 分钟内有效，一次性使用。"), true);
+    } else {
+        setSettingsActionFeedback(hwnd,
+            tr(L"Generate pair code failed: ", L"生成配对码失败：") + utf8ToWide(error), false);
+    }
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// 加入申请轮询结果（kSyncJoinPollResultMessage，UI 线程）
+void handleSyncJoinPollResult(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    bool has = false;
+    bool ok = false;
+    int phase = 0;
+    std::string token;
+    std::string deviceId;
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        has = g_app->syncJoinPollHas;
+        ok = g_app->syncJoinPollOk;
+        phase = g_app->syncJoinPollPhase;
+        token = g_app->syncJoinPollToken;
+        deviceId = g_app->syncJoinPollDeviceId;
+        error = g_app->syncJoinPollError;
+        g_app->syncJoinPollHas = false;
+    }
+    if (!has) return;
+    const bool stillPending = ok && phase == 0 && !g_app->syncJoinRequestId.empty();
+    if (stillPending) {
+        if (HWND status = settingsControl(hwnd, kSettingSyncStatus)) {
+            SetWindowTextW(status, tr(L"Waiting for approval...", L"等待对方确认..."));
+        }
+        return;
+    }
+    g_app->syncJoinRequestId.clear();
+    if (ok && phase == 1) {
+        g_app->settingsData.syncToken = token;
+        g_app->settingsData.syncDeviceId = deviceId;
+        g_app->settingsData.syncEnabled = true;
+        saveSettings(g_app->settingsData);
+        if (HWND toggle = settingsControl(hwnd, kSettingSyncEnabled)) {
+            setSettingsToggleValue(toggle, true);
+        }
+        if (HWND invite = settingsControl(hwnd, kSettingSyncInvite)) {
+            SetWindowTextW(invite, L"");
+        }
+        applySyncSettings();
+        refreshSyncStatusControl(hwnd);
+        setSettingsActionFeedback(hwnd,
+            tr(L"The other device approved. Paired and syncing.",
+               L"对方已允许加入，配对成功，同步已开启。"), true);
+    } else {
+        refreshSyncStatusControl(hwnd);
+        std::wstring message;
+        if (!ok) message = tr(L"Join request failed: ", L"加入申请失败：") + utf8ToWide(error);
+        else if (phase == 2) message = tr(L"The other device rejected the join request.",
+                                          L"对方拒绝了对本机的加入申请。");
+        else if (phase == 3) message = tr(L"Join request expired. Please request again.",
+                                          L"加入申请已过期，请重新提交。");
+        else message = tr(L"Join request no longer exists.", L"加入申请不存在或已失效。");
+        setSettingsActionFeedback(hwnd, message, false);
+    }
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// 把待确认列表画进只读框（仅展示第一条名称 + 计数）
+void refreshSyncPendingControl(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    HWND box = settingsControl(hwnd, kSettingSyncPending);
+    if (!box) return;
+    std::vector<clipsync::SyncManager::PendingJoinInfo> list;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPendingMutex);
+        list = g_app->syncPendingList;
+    }
+    if (list.empty()) {
+        SetWindowTextW(box, tr(L"No pending requests", L"暂无待确认申请"));
+        return;
+    }
+    std::wstring text = utf8ToWide(list.front().deviceName);
+    if (list.size() > 1) {
+        text += tr(L" (+", L"（+") + std::to_wstring(list.size() - 1) + tr(L" more", L"）");
+    }
+    SetWindowTextW(box, text.c_str());
+}
+
+// 待确认列表刷新结果（kSyncPendingResultMessage，UI 线程）
+void handleSyncPendingResult(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    bool has = false;
+    bool ok = false;
+    std::string error;
+    bool decideDone = false;
+    bool decideApproved = false;
+    std::string decideName;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPendingMutex);
+        has = g_app->syncPendingHas;
+        ok = g_app->syncPendingOk;
+        error = g_app->syncPendingError;
+        decideDone = g_app->syncDecideDone;
+        decideApproved = g_app->syncDecideApproved;
+        decideName = g_app->syncDecideName;
+        g_app->syncPendingHas = false;
+        g_app->syncDecideDone = false;
+    }
+    if (has && decideDone) {
+        if (ok) {
+            std::wstring message =
+                decideApproved
+                    ? tr(L"Approved \"", L"已允许 \"") + utf8ToWide(decideName) +
+                          tr(L"\" to join. The device can now sync.",
+                            L"\" 加入，该设备已可同步。")
+                    : tr(L"Rejected the join request from \"", L"已拒绝 \"") +
+                          utf8ToWide(decideName) + tr(L"\".", L"\" 的加入申请。");
+            setSettingsActionFeedback(hwnd, message, true);
+        } else {
+            setSettingsActionFeedback(hwnd,
+                tr(L"Operation failed: ", L"操作失败：") + utf8ToWide(error), false);
+        }
+    } else if (has && !ok && !error.empty()) {
+        // 轮询失败静默：仅记录诊断日志，避免刷屏
+        appendDiagnosticLog("WARN", ("sync: pending list failed: " + error).c_str());
+    }
+    refreshSyncPendingControl(hwnd);
+}
+
+// 房主允许/拒绝（作用于待确认列表第一条）
+void handleSyncDecideClicked(HWND hwnd, bool approve) {
+    if (!g_app || !hwnd) return;
+    std::string requestId;
+    std::string name;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPendingMutex);
+        if (g_app->syncPendingBusy) return;
+        if (g_app->syncPendingList.empty()) {
+            setSettingsActionFeedback(hwnd,
+                tr(L"No pending join request.", L"当前没有待确认的加入申请。"), false);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return;
+        }
+        requestId = g_app->syncPendingList.front().requestId;
+        name = g_app->syncPendingList.front().deviceName;
+        g_app->syncPendingBusy = true;
+    }
+    const std::string server = g_app->settingsData.syncServer;
+    const std::string token = g_app->settingsData.syncToken;
+    if (HWND box = settingsControl(hwnd, kSettingSyncPending)) {
+        SetWindowTextW(box, tr(L"Processing...", L"处理中..."));
+    }
+    const HWND settingsWindow = hwnd;
+    std::thread([settingsWindow, server, token, requestId, name, approve] {
+        std::string error;
+        const bool ok = clipsync::SyncManager::DevicePendingDecide(
+            utf8ToWide(server), token, requestId, approve, error);
+        appendDiagnosticLog(ok ? "INFO" : "WARN",
+                            ok ? "sync: pending decide ok" : "sync: pending decide failed");
+        if (g_app) {
+            std::lock_guard<std::mutex> lock(g_app->syncPendingMutex);
+            g_app->syncPendingBusy = false;
+            g_app->syncPendingHas = true;   // 触发一次结果反馈 + 列表刷新
+            g_app->syncPendingOk = ok;
+            g_app->syncPendingError = ok ? std::string() : error;
+            g_app->syncDecideDone = true;
+            g_app->syncDecideApproved = approve;
+            g_app->syncDecideName = name;
+        }
+        PostMessageW(settingsWindow, kSyncPendingResultMessage, 0, 0);
+    }).detach();
+}
+
+// 定时轮询派发（UI 线程调用，每 2 秒一次；请求在后台线程执行）
+// - 加入方：有待确认申请时轮询 join/status；
+// - 房主：已配对时刷新待确认列表。
+void syncPollTickOnce(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    std::string joinRequestId;
+    std::string server;
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        joinRequestId = g_app->syncJoinRequestId;
+        server = g_app->settingsData.syncServer;
+        token = g_app->settingsData.syncToken;
+    }
+    const HWND settingsWindow = hwnd;
+    if (!joinRequestId.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+            if (g_app->syncJoinPollBusy) return;
+            g_app->syncJoinPollBusy = true;
+        }
+        std::thread([settingsWindow, server, joinRequestId] {
+            using clipsync::SyncManager;
+            SyncManager::JoinPhase phase = SyncManager::JoinPhase::Requested;
+            std::string deviceId;
+            std::string tokenOut;
+            std::string error;
+            const bool ok = SyncManager::DeviceJoinPoll(utf8ToWide(server), joinRequestId,
+                                                        phase, deviceId, tokenOut, error);
+            if (g_app) {
+                std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+                g_app->syncJoinPollHas = true;
+                g_app->syncJoinPollOk = ok;
+                g_app->syncJoinPollPhase = static_cast<int>(phase);
+                g_app->syncJoinPollToken = tokenOut;
+                g_app->syncJoinPollDeviceId = deviceId;
+                g_app->syncJoinPollError = error;
+                g_app->syncJoinPollBusy = false;
+            }
+            PostMessageW(settingsWindow, kSyncJoinPollResultMessage, 0, 0);
+        }).detach();
+        return;
+    }
+    if (!token.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(g_app->syncPendingMutex);
+            if (g_app->syncPendingBusy) return;
+            g_app->syncPendingBusy = true;
+        }
+        std::thread([settingsWindow, server, token] {
+            std::vector<clipsync::SyncManager::PendingJoinInfo> list;
+            std::string error;
+            const bool ok = clipsync::SyncManager::DevicePendingList(utf8ToWide(server), token,
+                                                                     list, error);
+            if (g_app) {
+                std::lock_guard<std::mutex> lock(g_app->syncPendingMutex);
+                if (ok) g_app->syncPendingList = std::move(list); // 失败保留旧列表
+                g_app->syncPendingError = ok ? std::string() : error;
+                g_app->syncPendingOk = ok;
+                g_app->syncPendingHas = true;
+                g_app->syncPendingBusy = false;
+            }
+            PostMessageW(settingsWindow, kSyncPendingResultMessage, 0, 0);
+        }).detach();
+    }
+}
+
 // "解除配对"按钮
 void handleSyncUnpairClicked(HWND hwnd) {
     if (!g_app || !hwnd) return;
@@ -1675,8 +2022,23 @@ void handleSyncUnpairClicked(HWND hwnd) {
     g_app->settingsData.syncDeviceId.clear();
     g_app->settingsData.syncEnabled = false;
     saveSettings(g_app->settingsData);
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        g_app->syncJoinRequestId.clear();
+        g_app->syncGenCode.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPendingMutex);
+        g_app->syncPendingList.clear();
+    }
     if (HWND toggle = settingsControl(hwnd, kSettingSyncEnabled)) {
         setSettingsToggleValue(toggle, false);
+    }
+    if (HWND box = settingsControl(hwnd, kSettingSyncCodeBox)) {
+        SetWindowTextW(box, L"");
+    }
+    if (HWND box = settingsControl(hwnd, kSettingSyncPending)) {
+        SetWindowTextW(box, L"");
     }
     applySyncSettings();
     refreshSyncStatusControl(hwnd);
@@ -7416,10 +7778,19 @@ SettingsLayout buildSettingsLayout(HWND hwnd) {
                             {kSettingSyncEnabled}, {36}, {20}, contentWidth),
             makeSettingsRow(hwnd, tr(L"Server address", L"服务器地址"),
                             {kSettingSyncServer}, {360}, {30}, contentWidth),
-            makeSettingsRow(hwnd, tr(L"Invite code", L"邀请码"),
-                            {kSettingSyncInvite, kSettingSyncPair}, {150, 80}, {30, 30}, contentWidth),
             makeSettingsRow(hwnd, tr(L"Device status", L"设备状态"),
                             {kSettingSyncStatus}, {250}, {30}, contentWidth)
+        });
+        makeCard(tr(L"Join another device", L"加入其他设备"), {
+            makeSettingsRow(hwnd, tr(L"Pair code", L"对方配对码"),
+                            {kSettingSyncInvite, kSettingSyncPair}, {150, 80}, {30, 30}, contentWidth)
+        });
+        makeCard(tr(L"Invite devices to this room", L"邀请设备加入本房间"), {
+            makeSettingsRow(hwnd, tr(L"Generate pair code", L"生成配对码"),
+                            {kSettingSyncGenCode, kSettingSyncCodeBox}, {108, 220}, {30, 30}, contentWidth),
+            makeSettingsRow(hwnd, tr(L"Pending approval", L"待确认设备"),
+                            {kSettingSyncPending, kSettingSyncApprove, kSettingSyncReject},
+                            {170, 64, 64}, {30, 30, 30}, contentWidth)
         });
         makeCard(tr(L"Device", L"设备管理"), {
             makeSettingsRow(hwnd, tr(L"Remove pairing from this device", L"清除本机配对，停止同步"),
@@ -8945,26 +9316,56 @@ void createSettingsControlsModern(HWND hwnd) {
                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncServer)),
                     GetModuleHandleW(nullptr), nullptr);
     CreateWindowExW(0, L"EDIT", L"",
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOHSCROLL,
-                    ui(520 - kSettingsSidebarWidth), ui(180 - kSettingsHeaderHeight),
-                    ui(150), ui(30), parent,
-                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncInvite)),
-                    GetModuleHandleW(nullptr), nullptr);
-    CreateWindowW(L"BUTTON", tr(L"Pair", L"配对"),
-                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-                  ui(678 - kSettingsSidebarWidth), ui(180 - kSettingsHeaderHeight),
-                  ui(80), ui(30), parent,
-                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncPair)),
-                  GetModuleHandleW(nullptr), nullptr);
-    CreateWindowExW(0, L"EDIT", L"",
                     WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL,
-                    ui(520 - kSettingsSidebarWidth), ui(220 - kSettingsHeaderHeight),
+                    ui(520 - kSettingsSidebarWidth), ui(180 - kSettingsHeaderHeight),
                     ui(250), ui(30), parent,
                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncStatus)),
                     GetModuleHandleW(nullptr), nullptr);
-    CreateWindowW(L"BUTTON", tr(L"Unpair", L"解除配对"),
+    CreateWindowExW(0, L"EDIT", L"",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOHSCROLL,
+                    ui(520 - kSettingsSidebarWidth), ui(220 - kSettingsHeaderHeight),
+                    ui(150), ui(30), parent,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncInvite)),
+                    GetModuleHandleW(nullptr), nullptr);
+    CreateWindowW(L"BUTTON", tr(L"Join", L"加入"),
+                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                  ui(678 - kSettingsSidebarWidth), ui(220 - kSettingsHeaderHeight),
+                  ui(80), ui(30), parent,
+                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncPair)),
+                  GetModuleHandleW(nullptr), nullptr);
+    CreateWindowW(L"BUTTON", tr(L"Generate code", L"生成配对码"),
                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                   ui(520 - kSettingsSidebarWidth), ui(260 - kSettingsHeaderHeight),
+                  ui(108), ui(30), parent,
+                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncGenCode)),
+                  GetModuleHandleW(nullptr), nullptr);
+    CreateWindowExW(0, L"EDIT", L"",
+                    WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL,
+                    ui(636 - kSettingsSidebarWidth), ui(260 - kSettingsHeaderHeight),
+                    ui(220), ui(30), parent,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncCodeBox)),
+                    GetModuleHandleW(nullptr), nullptr);
+    CreateWindowExW(0, L"EDIT", L"",
+                    WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL,
+                    ui(520 - kSettingsSidebarWidth), ui(300 - kSettingsHeaderHeight),
+                    ui(170), ui(30), parent,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncPending)),
+                    GetModuleHandleW(nullptr), nullptr);
+    CreateWindowW(L"BUTTON", tr(L"Approve", L"允许"),
+                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                  ui(698 - kSettingsSidebarWidth), ui(300 - kSettingsHeaderHeight),
+                  ui(64), ui(30), parent,
+                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncApprove)),
+                  GetModuleHandleW(nullptr), nullptr);
+    CreateWindowW(L"BUTTON", tr(L"Reject", L"拒绝"),
+                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                  ui(770 - kSettingsSidebarWidth), ui(300 - kSettingsHeaderHeight),
+                  ui(64), ui(30), parent,
+                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncReject)),
+                  GetModuleHandleW(nullptr), nullptr);
+    CreateWindowW(L"BUTTON", tr(L"Unpair", L"解除配对"),
+                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                  ui(520 - kSettingsSidebarWidth), ui(340 - kSettingsHeaderHeight),
                   ui(108), ui(30), parent,
                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncUnpair)),
                   GetModuleHandleW(nullptr), nullptr);
@@ -9135,6 +9536,8 @@ void updateSettingsTabControls(HWND hwnd, bool redraw) {
                          kSettingShortcutDelete,
                         kSettingSyncEnabled, kSettingSyncServer, kSettingSyncInvite,
                         kSettingSyncPair, kSettingSyncUnpair, kSettingSyncStatus,
+                        kSettingSyncGenCode, kSettingSyncCodeBox,
+                        kSettingSyncApprove, kSettingSyncReject, kSettingSyncPending,
                         kSettingCategoryMaxBase, kSettingCategoryMaxBase + 1,
                         kSettingCategoryMaxBase + 2,
                          kSettingCategoryDiskBase, kSettingCategoryDiskBase + 1,
@@ -12936,6 +13339,18 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             handleSyncPairResult(hwnd);
             return 0;
         }
+        if (message == kSyncGenCodeResultMessage) {
+            handleSyncGenCodeResult(hwnd);
+            return 0;
+        }
+        if (message == kSyncJoinPollResultMessage) {
+            handleSyncJoinPollResult(hwnd);
+            return 0;
+        }
+        if (message == kSyncPendingResultMessage) {
+            handleSyncPendingResult(hwnd);
+            return 0;
+        }
         if (message == WM_TIMER && wParam == kSettingsDropdownTimer) {
             if (!g_app->languageDropdown) {
                 KillTimer(hwnd, kSettingsDropdownTimer);
@@ -12958,6 +13373,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         if (message == WM_TIMER && wParam == kSettingsSyncStateTimer) {
             if (!g_app->settingsClosing && g_app->settingsTab == kSettingsSyncPage) {
                 refreshSyncStatusControl(hwnd);
+                // 每 2 秒派发一次后台轮询：加入申请状态 / 房主待确认列表
+                if (++g_app->syncPollTick % 2 == 0) {
+                    appendDiagnosticLog("INFO", "sync: poll tick");
+                    syncPollTickOnce(hwnd);
+                }
             } else {
                 KillTimer(hwnd, kSettingsSyncStateTimer);
             }
@@ -13163,6 +13583,12 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 if (g_app->settingsTab == kSettingsAppearancePage &&
                     !confirmThemeEditorExit(hwnd)) return 0;
                 g_app->settingsTab = std::clamp((y - ui(50)) / ui(38), 0, 6);
+                {
+                    char navLog[96]{};
+                    std::snprintf(navLog, sizeof(navLog), "settings: nav click -> tab=%d",
+                                  g_app->settingsTab);
+                    appendDiagnosticLog("INFO", navLog);
+                }
                 g_app->settingsScrollOffset = 0;
                 updateSettingsTabControls(hwnd);
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -13237,6 +13663,18 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             }
             if (LOWORD(wParam) == kSettingSyncUnpair && HIWORD(wParam) == BN_CLICKED) {
                 handleSyncUnpairClicked(hwnd);
+                return 0;
+            }
+            if (LOWORD(wParam) == kSettingSyncGenCode && HIWORD(wParam) == BN_CLICKED) {
+                handleSyncGenCodeClicked(hwnd);
+                return 0;
+            }
+            if (LOWORD(wParam) == kSettingSyncApprove && HIWORD(wParam) == BN_CLICKED) {
+                handleSyncDecideClicked(hwnd, true);
+                return 0;
+            }
+            if (LOWORD(wParam) == kSettingSyncReject && HIWORD(wParam) == BN_CLICKED) {
+                handleSyncDecideClicked(hwnd, false);
                 return 0;
             }
             const int actionId = LOWORD(wParam);

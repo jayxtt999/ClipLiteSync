@@ -86,11 +86,48 @@ public:
     bool PublishMeta(const std::string& kind, const std::string& syncId,
                      std::uint64_t hash, bool pinned);
 
-    // 一次性配对：邀请码 → 设备 token（REST POST /v1/device/join，可在后台线程调用）
-    // 成功返回 true 并填 deviceId/deviceToken；失败时 errorUtf8 携带服务端错误（UTF-8）。
-    static bool DeviceJoin(const std::wstring& serverUrl, const std::string& inviteCode,
-                           const std::string& deviceName, std::string& deviceId,
-                           std::string& deviceToken, std::string& errorUtf8);
+    // ---------- 房间制配对（REST，独立于 WS 数据面，均可在后台线程调用） ----------
+    //
+    // 流程（协议 v0.3）：
+    //   已配对设备：DeviceInvite 生成 8 位一次性配对码（10 分钟有效）；
+    //   新设备：    DeviceJoinRequest 填码提交申请（得到 requestId，状态 pending），
+    //               轮询 DeviceJoinPoll 直到 approved（拿 token）/ rejected / expired；
+    //   房主：      DevicePendingList 拉取待确认申请，DevicePendingDecide 允许/拒绝。
+    // 创始码（服务端管理员生成）在 DeviceJoinRequest 中直接返回 approved + token。
+
+    enum class JoinPhase { Requested, Approved, Rejected, Expired, NotFound };
+
+    struct PendingJoinInfo {
+        std::string requestId;
+        std::string deviceName;
+        std::int64_t createdAt = 0; // Unix 毫秒
+    };
+
+    // 已配对设备生成配对码；成功返回 true 并填 code（8 位）/ expiresAtMs
+    static bool DeviceInvite(const std::wstring& serverUrl, const std::string& deviceToken,
+                             std::string& code, std::int64_t& expiresAtMs, std::string& errorUtf8);
+
+    // 新设备提交加入申请。返回 true 表示请求本身成功（按 phase 区分）：
+    // Approved = 创始码直接配对成功（deviceId/deviceToken 有效）；
+    // Requested = 已提交，等待房主确认（requestId 有效）。
+    static bool DeviceJoinRequest(const std::wstring& serverUrl, const std::string& code,
+                                  const std::string& deviceName, JoinPhase& phase,
+                                  std::string& requestId, std::string& deviceId,
+                                  std::string& deviceToken, std::string& errorUtf8);
+
+    // 轮询加入申请状态；Approved 时填 deviceId/deviceToken
+    static bool DeviceJoinPoll(const std::wstring& serverUrl, const std::string& requestId,
+                               JoinPhase& phase, std::string& deviceId,
+                               std::string& deviceToken, std::string& errorUtf8);
+
+    // 房主拉取待确认申请列表
+    static bool DevicePendingList(const std::wstring& serverUrl, const std::string& deviceToken,
+                                  std::vector<PendingJoinInfo>& out, std::string& errorUtf8);
+
+    // 房主允许/拒绝某个申请
+    static bool DevicePendingDecide(const std::wstring& serverUrl, const std::string& deviceToken,
+                                    const std::string& requestId, bool approve,
+                                    std::string& errorUtf8);
 
     SyncState state() const { return state_.load(); }
     std::int64_t lastSeq() const { return lastSeq_.load(); }
@@ -113,6 +150,10 @@ private:
     static std::string buildEventJson(const SyncEvent& e);
     static bool parseUrl(const std::wstring& url, std::wstring& host, int& port, bool& secure,
                          std::wstring& path);
+    // REST 基础请求（WinHTTP，8s 超时；bearer 可为空）
+    static bool restCall(const std::wstring& serverUrl, const wchar_t* method, const wchar_t* path,
+                         const std::string& bodyJson, const std::string& bearer,
+                         int& status, std::string& response, std::string& errorUtf8);
 
     SyncConfig config_;
     RemoteClipHandler remoteHandler_;

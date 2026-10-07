@@ -93,14 +93,22 @@
 
 ## 5. REST 接口（管理面，非数据面）
 
+配对模型（v0.3，房间制）：已配对设备可生成**一次性配对码**（8 位大写字母+数字，去掉易混淆的 0/1/I/O，10 分钟有效）；新设备填码提交**加入申请**（不直接发 token），由生成码的设备**确认后才发 token**。管理员生成的"创始码"用于引导首台设备（无确认人，直接放行）。
+
 | 方法/路径 | 说明 |
 | --- | --- |
-| `POST /v1/admin/login` | 管理员密码 → admin token（`.env`/配置文件设初始密码） |
-| `POST /v1/device/join` | `{inviteCode, deviceName}` → `{deviceToken, groupId}`（一次性邀请码） |
-| `POST /v1/admin/invite` | 生成一次性邀请码 |
+| `POST /v1/admin/login` | 管理员密码 → admin token（未设置 `CLIPSYNC_ADMIN_PASSWORD` 时返回 403，管理面不可用） |
+| `POST /v1/admin/invite` | 生成一次性创始码（管理员，引导首台设备） |
+| `POST /v1/device/invite` | 已配对设备生成配对码 → `{code, expiresAt}`（每设备同时最多 5 个有效码） |
+| `POST /v1/device/join` | `{inviteCode, deviceName}`；创始码 → `{status:"approved", deviceId, deviceToken}`；设备码 → `{status:"pending", requestId}` |
+| `GET  /v1/device/join/status?requestId=` | 申请方轮询 → `{status: pending\|approved(+token)\|rejected\|expired\|not_found}` |
+| `GET  /v1/device/pending` | 房主拉取自己码的待确认申请 |
+| `POST /v1/device/pending/decide` | 房主 `{requestId, approve}` 允许/拒绝 |
 | `GET  /v1/admin/devices` | 设备列表 |
 | `DELETE /v1/admin/devices/{id}` | 吊销设备（吊销后 token 立即失效） |
 | `GET  /healthz` | 存活检查 |
+
+**防暴力遍历**（`/v1/device/join`，按 IP）：每分钟最多 5 次；连续失败 10 次锁定 15 分钟；成功清零计数。
 
 数据面不走 REST（仅 WS）；预留 HTTP `POST /v1/publish`（同等鉴权与格式）供二期 Android 简化接入。
 
@@ -111,3 +119,4 @@ TLS 由部署层承担（局域网明文可接受；公网必须 `wss://`，推�
 ## 7. 版本
 
 - v0.2（2026-10-07）：冻结。相比 v0.1 删除快照/持久化日志/保留策略，改为内存环形缓冲补发。
+- v0.3（2026-10-07）：房间制配对。设备生成 8 位配对码 + 加入需房主确认；join 接口防爆破（按 IP 限速/锁定）；移除默认管理员密码。

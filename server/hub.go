@@ -280,6 +280,10 @@ func respond(w http.ResponseWriter, code int, v any) {
 }
 
 func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.AdminPassword == "" {
+		respond(w, 403, map[string]string{"error": "服务端未设置 CLIPSYNC_ADMIN_PASSWORD，管理接口不可用"})
+		return
+	}
 	var req struct {
 		Password string `json:"password"`
 	}
@@ -299,7 +303,9 @@ func (s *Server) handleAdminInvite(w http.ResponseWriter, r *http.Request) {
 		respond(w, 401, map[string]string{"error": "未授权"})
 		return
 	}
-	respond(w, 200, map[string]string{"inviteCode": s.invites.New(s.cfg.InviteTTL)})
+	inv := s.invites.New("admin", s.cfg.InviteTTL)
+	log.Printf("[pair] 管理员生成创始码 %s", inv.Code)
+	respond(w, 200, map[string]string{"inviteCode": inv.Code})
 }
 
 func (s *Server) handleAdminDevices(w http.ResponseWriter, r *http.Request) {
@@ -317,21 +323,4 @@ func (s *Server) handleAdminRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/v1/admin/devices/")
 	respond(w, 200, map[string]bool{"ok": s.devices.Revoke(id)})
-}
-
-func (s *Server) handleDeviceJoin(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		InviteCode string `json:"inviteCode"`
-		DeviceName string `json:"deviceName"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !s.invites.Take(req.InviteCode) {
-		respond(w, 403, map[string]string{"error": "邀请码无效或已使用"})
-		return
-	}
-	d, err := s.devices.Create(req.DeviceName)
-	if err != nil {
-		respond(w, 500, map[string]string{"error": err.Error()})
-		return
-	}
-	respond(w, 200, map[string]string{"deviceId": d.ID, "deviceToken": d.Token})
 }

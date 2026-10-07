@@ -39,8 +39,9 @@ func loadConfig() Config {
 		InviteTTL:      10 * time.Minute,
 	}
 	if c.AdminPassword == "" {
-		c.AdminPassword = "admin123"
-		log.Println("[warn] CLIPSYNC_ADMIN_PASSWORD 未设置，使用默认密码 admin123，请尽快修改")
+		// 安全基线：不再提供默认密码。未设置时管理接口不可用（也无"创始码"，
+		// 全新部署必须显式设置 CLIPSYNC_ADMIN_PASSWORD 才能引导第一台设备）。
+		log.Println("[warn] CLIPSYNC_ADMIN_PASSWORD 未设置：管理接口与创始码不可用，无法引导首台设备")
 	}
 	return c
 }
@@ -159,6 +160,7 @@ type Invite struct {
 	Code      string    `json:"code"`
 	ExpiresAt time.Time `json:"expiresAt"`
 	Used      bool      `json:"used"`
+	CreatedBy string    `json:"createdBy"` // 设备 ID 或 "admin"
 }
 
 type InviteStore struct {
@@ -170,17 +172,31 @@ func NewInviteStore() *InviteStore {
 	return &InviteStore{invites: map[string]*Invite{}}
 }
 
-func (is *InviteStore) New(ttl time.Duration) string {
+// New 生成 8 位一次性配对码（大写字母+数字，去掉易混淆的 0/1/I/O）
+func (is *InviteStore) New(createdBy string, ttl time.Duration) *Invite {
 	is.mu.Lock()
 	defer is.mu.Unlock()
-	// 6 位数字码
-	b := make([]byte, 4)
-	rand.Read(b)
-	code := fmt.Sprintf("%06d", int(b[0])<<24|int(b[1])<<16|int(b[2])<<8|int(b[3]))[:6]
-	is.invites[code] = &Invite{Code: code, ExpiresAt: time.Now().Add(ttl)}
-	return code
+	is.cleanupLocked()
+	var code string
+	for {
+		code = randomCode(8)
+		if _, exists := is.invites[code]; !exists {
+			break
+		}
+	}
+	inv := &Invite{Code: code, ExpiresAt: time.Now().Add(ttl), CreatedBy: createdBy}
+	is.invites[code] = inv
+	return inv
 }
 
+// Peek 只读查看（join 限速判定用，不消耗）
+func (is *InviteStore) Peek(code string) *Invite {
+	is.mu.Lock()
+	defer is.mu.Unlock()
+	return is.invites[code]
+}
+
+// Take 消耗一次性码（成功返回 true）
 func (is *InviteStore) Take(code string) bool {
 	is.mu.Lock()
 	defer is.mu.Unlock()
@@ -190,6 +206,29 @@ func (is *InviteStore) Take(code string) bool {
 	}
 	inv.Used = true
 	return true
+}
+
+// ListByCreator 某设备生成的全部码
+func (is *InviteStore) ListByCreator(createdBy string) []*Invite {
+	is.mu.Lock()
+	defer is.mu.Unlock()
+	var out []*Invite
+	for _, inv := range is.invites {
+		if inv.CreatedBy == createdBy {
+			out = append(out, inv)
+		}
+	}
+	return out
+}
+
+func (is *InviteStore) cleanupLocked() {
+	now := time.Now()
+	for code, inv := range is.invites {
+		// 已用/已过期 1 小时后清理
+		if inv.Used || now.After(inv.ExpiresAt.Add(time.Hour)) {
+			delete(is.invites, code)
+		}
+	}
 }
 
 // ---------- 管理员 token（内存态，重启失效） ----------
@@ -226,7 +265,8 @@ func main() {
 	}
 	hub := NewHub(cfg)
 
-	srv := &Server{cfg: cfg, devices: devices, invites: NewInviteStore(), admin: &AdminTokens{tokens: map[string]bool{}}, hub: hub}
+	srv := &Server{cfg: cfg, devices: devices, invites: NewInviteStore(), pending: NewPendingStore(),
+		joinGuard: NewJoinGuard(), admin: &AdminTokens{tokens: map[string]bool{}}, hub: hub}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200); w.Write([]byte("ok")) })
@@ -234,7 +274,11 @@ func main() {
 	mux.HandleFunc("/v1/admin/invite", srv.handleAdminInvite)
 	mux.HandleFunc("/v1/admin/devices", srv.handleAdminDevices)
 	mux.HandleFunc("/v1/admin/devices/", srv.handleAdminRevoke)
+	mux.HandleFunc("/v1/device/invite", srv.handleDeviceInvite)
 	mux.HandleFunc("/v1/device/join", srv.handleDeviceJoin)
+	mux.HandleFunc("/v1/device/join/status", srv.handleJoinStatus)
+	mux.HandleFunc("/v1/device/pending", srv.handleDevicePending)
+	mux.HandleFunc("/v1/device/pending/decide", srv.handlePendingDecide)
 	mux.HandleFunc("/ws", srv.handleWS)
 
 	log.Printf("ClipSync server 监听 :%s（数据目录 %s）", cfg.Port, cfg.DataDir)
@@ -244,9 +288,11 @@ func main() {
 }
 
 type Server struct {
-	cfg     Config
-	devices *DeviceStore
-	invites *InviteStore
-	admin   *AdminTokens
-	hub     *Hub
+	cfg       Config
+	devices   *DeviceStore
+	invites   *InviteStore
+	pending   *PendingStore
+	joinGuard *JoinGuard
+	admin     *AdminTokens
+	hub       *Hub
 }

@@ -546,6 +546,14 @@ std::string errorFromResponse(int status, const std::string& response) {
 }
 } // namespace
 
+// 服务器可达性探测：GET /healthz，只要请求完成（有响应）即视为可达
+bool SyncManager::ServerPing(const std::wstring& serverUrl, std::string& errorUtf8) {
+    int status = 0;
+    std::string response;
+    return restCall(serverUrl, L"GET", L"/healthz", std::string(), std::string(),
+                    status, response, errorUtf8);
+}
+
 bool SyncManager::DeviceInvite(const std::wstring& serverUrl, const std::string& deviceToken,
                                std::string& code, std::int64_t& expiresAtMs, std::string& errorUtf8) {
     int status = 0;

@@ -144,6 +144,9 @@ public:
     static bool DevicePeerRevoke(const std::wstring& serverUrl, const std::string& deviceToken,
                                  const std::string& deviceId, std::string& errorUtf8);
 
+    // 服务器可达性探测（GET /healthz，用于未配对时区分"连不上"和"没配对"）
+    static bool ServerPing(const std::wstring& serverUrl, std::string& errorUtf8);
+
     SyncState state() const { return state_.load(); }
     std::int64_t lastSeq() const { return lastSeq_.load(); }
 

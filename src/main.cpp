@@ -198,6 +198,7 @@ constexpr UINT kSyncGenCodeResultMessage = WM_APP + 19;   // 配对码生成结�
 constexpr UINT kSyncJoinPollResultMessage = WM_APP + 20;  // 加入申请轮询结果
 constexpr UINT kSyncPendingResultMessage = WM_APP + 21;   // 待确认列表刷新
 constexpr UINT kSyncPeersResultMessage = WM_APP + 22;     // 房间成员列表刷新 / 移除结果
+constexpr UINT kSyncProbeResultMessage = WM_APP + 23;     // 未配对时服务器探测结果
 constexpr UINT_PTR kExpiryTimer = 3;
 constexpr UINT_PTR kClipboardCaptureTimer = 7;
 constexpr UINT_PTR kSettingsToggleTimer = 4;
@@ -672,6 +673,11 @@ struct AppState {
     // 设备状态展示（UI 线程 owner-draw 绘制）
     std::wstring syncStatusText;
     int syncStatusKind = 0; // 0 未配对 1 在线 2 连接中 3 离线 4 已停用 5 等待确认 6 提交中
+    // 未配对时对服务器的可达性探测（区分"服务器连不上"和"能连上但没配对"）
+    std::mutex syncProbeMutex;
+    bool syncProbeBusy = false;
+    int syncProbeState = 0;        // 0 未探测 1 可达 2 不可达
+    std::int64_t syncProbeAt = 0;  // 上次探测时间（Unix 秒，节流 5 秒）
     UINT syncPollTick = 0;               // 轮询节流（每 2 秒一次）
     int benchmarkExitCode = 0;
     std::uint64_t ignoredClipboardHash = 0;
@@ -1574,26 +1580,48 @@ void applySyncSettings() {
 HWND settingsControl(HWND settings, int id);
 
 // 设备状态展示：文本与状态色存 AppState，由 owner-draw 静态控件绘制（无输入框边框）
+// 未配对时细分三种情况：没填服务器地址 / 填了但连不上 / 能连上但还没配对
 void refreshSyncStatusControl(HWND hwnd) {
     if (!g_app) return;
     const Settings& s = g_app->settingsData;
     std::wstring text;
-    int kind = 0; // 0 未配对
+    int kind = 0; // 0 中性（灰） 1 在线（绿） 2/5/6 过程中（橙） 3 异常（红） 4 已停用
     if (s.syncToken.empty()) {
-        text = languageIsChinese() ? L"未配对" : L"Not paired";
+        if (s.syncServer.empty()) {
+            text = languageIsChinese() ? L"未配置：先在上方填写服务器地址"
+                                       : L"Not configured: fill in the server address above";
+        } else {
+            int probe = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_app->syncProbeMutex);
+                probe = g_app->syncProbeState;
+            }
+            if (probe == 1) {
+                text = languageIsChinese()
+                    ? L"未配对 · 服务器连接正常，填入配对码后点「加入」"
+                    : L"Not paired · server reachable, enter a pair code and click Join";
+            } else if (probe == 2) {
+                text = languageIsChinese()
+                    ? L"未配对 · 无法连接服务器，请检查地址与网络"
+                    : L"Not paired · cannot reach the server, check address and network";
+                kind = 3;
+            } else {
+                text = languageIsChinese() ? L"未配对 · 正在检查服务器..." : L"Not paired · checking server...";
+            }
+        }
     } else {
-        text = utf8ToWide(s.syncDeviceId);
+        text = languageIsChinese() ? L"已配对" : L"Paired";
         if (!s.syncEnabled) {
-            text += languageIsChinese() ? L" · 已停用" : L" · disabled";
+            text += languageIsChinese() ? L" · 同步已停用" : L" · sync disabled";
             kind = 4;
         } else {
             switch (g_app->sync.state()) {
             case clipsync::SyncState::Online:
-                text += languageIsChinese() ? L" · 在线" : L" · online"; kind = 1; break;
+                text += languageIsChinese() ? L" · 在线同步中" : L" · online"; kind = 1; break;
             case clipsync::SyncState::Connecting:
-                text += languageIsChinese() ? L" · 连接中" : L" · connecting"; kind = 2; break;
+                text += languageIsChinese() ? L" · 正在连接服务器" : L" · connecting"; kind = 2; break;
             case clipsync::SyncState::Offline:
-                text += languageIsChinese() ? L" · 离线" : L" · offline"; kind = 3; break;
+                text += languageIsChinese() ? L" · 离线（将自动重连）" : L" · offline (retrying)"; kind = 3; break;
             default: break;
             }
         }
@@ -1642,6 +1670,7 @@ std::string syncTrimmedUtf8(HWND control) {
 // 创始码（管理员生成）直接返回 token；设备生成的码进入待确认，由房主放行。
 void handleSyncPairClicked(HWND hwnd) {
     if (!g_app || !hwnd) return;
+    appendDiagnosticLog("INFO", "sync: join button clicked");
     {
         std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
         if (g_app->syncPairBusy) {
@@ -1653,10 +1682,25 @@ void handleSyncPairClicked(HWND hwnd) {
     }
     const std::string server = syncTrimmedUtf8(settingsControl(hwnd, kSettingSyncServer));
     const std::string code = syncTrimmedUtf8(settingsControl(hwnd, kSettingSyncInvite));
-    if (server.empty() || code.empty()) {
+    // 校验分字段提示，避免"填了一半却提示两个都要填"
+    if (server.empty() && code.empty()) {
         setSettingsActionFeedback(hwnd,
-            tr(L"Enter the server address and pair code first.", L"请先填写服务器地址和配对码。"),
-            false);
+            tr(L"Enter the server address and the pair code from the other device.",
+               L"请先填写服务器地址，再填写对方设备生成的配对码。"), false);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+    if (server.empty()) {
+        setSettingsActionFeedback(hwnd,
+            tr(L"Enter the server address first, e.g. ws://192.168.1.10:8765",
+               L"请先填写服务器地址，例如 ws://192.168.1.10:8765"), false);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+    if (code.empty()) {
+        setSettingsActionFeedback(hwnd,
+            tr(L"Enter the pair code generated on the other device (8 characters).",
+               L"请先填写对方设备「生成配对码」得到的 8 位配对码。"), false);
         InvalidateRect(hwnd, nullptr, FALSE);
         return;
     }
@@ -1674,9 +1718,7 @@ void handleSyncPairClicked(HWND hwnd) {
         std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
         g_app->syncPairBusy = true;
     }
-    if (HWND status = settingsControl(hwnd, kSettingSyncStatus)) {
-        SetWindowTextW(status, tr(L"Submitting join request...", L"正在提交加入申请..."));
-    }
+    setSyncStatusTransient(hwnd, tr(L"Submitting join request...", L"正在提交加入申请..."), 6);
     const HWND settingsWindow = hwnd;
     std::thread([settingsWindow, server, code, deviceName] {
         using clipsync::SyncManager;
@@ -1762,8 +1804,11 @@ void handleSyncGenCodeClicked(HWND hwnd) {
     }
     if (token.empty()) {
         setSettingsActionFeedback(hwnd,
-            tr(L"Pair this device first to generate a pair code.",
-               L"请先完成本机配对，才能生成配对码。"), false);
+            tr(L"This device has not joined a sync room yet, so it cannot generate pair "
+               L"codes. Join first: enter a pair code above, or use the admin bootstrap "
+               L"code on the server.",
+               L"本机还没有加入任何同步房间，无法生成配对码。请先用上方「加入其他设备」"
+               L"填码加入，或在服务端用管理员创始码完成首次配对。"), false);
         InvalidateRect(hwnd, nullptr, FALSE);
         return;
     }
@@ -2151,6 +2196,38 @@ void syncPollTickOnce(HWND hwnd) {
             }
             PostMessageW(settingsWindow, kSyncJoinPollResultMessage, 0, 0);
         }).detach();
+        return;
+    }
+    if (token.empty() && !server.empty()) {
+        // 未配对：每 5 秒探测一次服务器可达性，让状态行区分"连不上"和"没配对"
+        std::int64_t lastProbe = 0;
+        bool probeBusy = false;
+        {
+            std::lock_guard<std::mutex> lock(g_app->syncProbeMutex);
+            lastProbe = g_app->syncProbeAt;
+            probeBusy = g_app->syncProbeBusy;
+        }
+        const std::int64_t nowSeconds = static_cast<std::int64_t>(nowUnix());
+        if (!probeBusy && nowSeconds - lastProbe >= 5) {
+            {
+                std::lock_guard<std::mutex> lock(g_app->syncProbeMutex);
+                g_app->syncProbeBusy = true;
+                g_app->syncProbeAt = nowSeconds;
+            }
+            std::thread([settingsWindow, server] {
+                std::string error;
+                const bool ok = clipsync::SyncManager::ServerPing(utf8ToWide(server), error);
+                int state = ok ? 1 : 2;
+                bool changed = false;
+                if (g_app) {
+                    std::lock_guard<std::mutex> lock(g_app->syncProbeMutex);
+                    changed = g_app->syncProbeState != state;
+                    g_app->syncProbeState = state;
+                    g_app->syncProbeBusy = false;
+                }
+                if (changed) PostMessageW(settingsWindow, kSyncProbeResultMessage, 0, 0);
+            }).detach();
+        }
         return;
     }
     if (!token.empty()) {
@@ -7809,7 +7886,8 @@ SettingsLayout buildSettingsLayout(HWND hwnd) {
     const int scrollbarReserve = kSettingsScrollbarReserve;
     const int contentWidth = std::max(1,
         clientWidth - kSettingsSidebarWidth - kSettingsBodyMargin * 2 - scrollbarReserve);
-    int cursor = 74;
+    // 同步页在标题下方预留一条反馈区（两行），避免操作提示被右上角区域截断
+    int cursor = (g_app->settingsTab == kSettingsSyncPage) ? 122 : 74;
     auto makeCard = [&](const wchar_t* title, std::vector<SettingsRowLayout> rows,
                         int extraHeight = 0) {
         SettingsCardLayout card;
@@ -7995,11 +8073,18 @@ SettingsLayout buildSettingsLayout(HWND hwnd) {
             makeSettingsRow(hwnd, tr(L"Server address", L"服务器地址"),
                             {kSettingSyncServer}, {360}, {30}, contentWidth),
             makeSettingsRow(hwnd, tr(L"Device status", L"设备状态"),
-                            {kSettingSyncStatus}, {250}, {30}, contentWidth)
+                            {kSettingSyncStatus}, {390}, {30}, contentWidth)
         });
         makeCard(tr(L"Join another device", L"加入其他设备"), {
             makeSettingsRow(hwnd, tr(L"Pair code", L"对方配对码"),
-                            {kSettingSyncInvite, kSettingSyncPair}, {150, 90}, {30, 30}, contentWidth)
+                            {kSettingSyncInvite, kSettingSyncPair}, {150, 90}, {30, 30}, contentWidth),
+            makeSettingsRow(hwnd,
+                            tr(L"How to: click \"Generate pair code\" on the other device, "
+                               L"enter the 8-character code above, then click Join. The other "
+                               L"device must approve before syncing starts.",
+                               L"操作：在对方设备的「邀请设备加入本房间」里点「生成配对码」，"
+                               L"把 8 位码填到上面后点「加入」；对方确认后才完成配对。"),
+                            {}, {}, {}, contentWidth)
         });
         {
             std::vector<SettingsRowLayout> rows;
@@ -8017,6 +8102,12 @@ SettingsLayout buildSettingsLayout(HWND hwnd) {
                         {64, 64}, {30, 30}, contentWidth));
                 }
             }
+            rows.push_back(makeSettingsRow(
+                hwnd,
+                tr(L"Codes are valid for 10 minutes, single use. Requests appear in the "
+                   L"list below for you to approve or reject.",
+                   L"配对码 10 分钟内有效、一次性使用。对方填码申请后会出现在下方待确认列表，由你决定允许或拒绝。"),
+                {}, {}, {}, contentWidth));
             makeCard(tr(L"Invite devices to this room", L"邀请设备加入本房间"), std::move(rows));
         }
         {
@@ -8339,15 +8430,18 @@ void paintSettingsContent(HWND hwnd, HDC dc, bool bodyOnly = false) {
     const int themeLeft = contentRight - ui(kSettingsThemeSaveWidth + kSettingsThemeGap) - themeWidth;
     const int themeTop = ui(14);
     SelectObject(dc, bodyFont);
-    SetTextColor(dc, g_app->settingsActionFeedback.empty()
-        ? secondary
-        : (g_app->settingsActionFeedbackSuccess ? accent : RGB(185, 28, 28)));
-    RECT saveState{themeLeft + themeWidth + ui(kSettingsThemeGap), ui(20),
-                   themeLeft + themeWidth + ui(kSettingsThemeGap + kSettingsThemeSaveWidth), ui(42)};
-    const wchar_t* saveLabel = g_app->settingsActionFeedback.empty()
-        ? settingsLocale().autoSaved : g_app->settingsActionFeedback.c_str();
-    DrawTextW(dc, saveLabel, -1, &saveState,
-              DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    // 注意：同步页的反馈在内容子窗口（bodyOnly 分支末尾）绘制，父窗口这里画了也会被盖住。
+    if (g_app->settingsTab != kSettingsSyncPage) {
+        SetTextColor(dc, g_app->settingsActionFeedback.empty()
+            ? secondary
+            : (g_app->settingsActionFeedbackSuccess ? accent : RGB(185, 28, 28)));
+        RECT saveState{themeLeft + themeWidth + ui(kSettingsThemeGap), ui(20),
+                       themeLeft + themeWidth + ui(kSettingsThemeGap + kSettingsThemeSaveWidth), ui(42)};
+        const wchar_t* saveLabel = g_app->settingsActionFeedback.empty()
+            ? settingsLocale().autoSaved : g_app->settingsActionFeedback.c_str();
+        DrawTextW(dc, saveLabel, -1, &saveState,
+                  DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
     if (g_app->settingsTab == kSettingsAppearancePage) {
         const COLORREF themeSurface = themeColor(ThemeColorRole::SidebarBackground);
         const COLORREF themeLine = themeColor(ThemeColorRole::Border);
@@ -8642,6 +8736,20 @@ void paintSettingsContent(HWND hwnd, HDC dc, bool bodyOnly = false) {
                          DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         drawSettingsText(dc, bodyFont, logValue.c_str(), logValueRect, text,
                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    // 同步页操作反馈：画在内容子窗口最上层（标题下方预留条带，child 坐标 = 逻辑y - 58），
+    // 两行可换行，配合出现反馈时滚动复位（setSettingsActionFeedback），保证完整可见不截断。
+    if (g_app->settingsTab == kSettingsSyncPage && !g_app->settingsActionFeedback.empty()) {
+        RECT feedbackRect{contentLeft, ui(76 - kSettingsHeaderHeight),
+                          contentRight, ui(118 - kSettingsHeaderHeight)};
+        const COLORREF pageBackground = highContrastEnabled()
+            ? GetSysColor(COLOR_WINDOW) : themeColor(ThemeColorRole::WindowBackground);
+        HBRUSH feedbackBrush = CreateSolidBrush(pageBackground);
+        FillRect(dc, &feedbackRect, feedbackBrush);
+        DeleteObject(feedbackBrush);
+        SetTextColor(dc, g_app->settingsActionFeedbackSuccess ? accent : RGB(185, 28, 28));
+        DrawTextW(dc, g_app->settingsActionFeedback.c_str(), -1, &feedbackRect,
+                  DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
     }
     RestoreDC(dc, bodyClip);
     }
@@ -11627,6 +11735,10 @@ void openDiagnosticLog(HWND hwnd) {
 void setSettingsActionFeedback(HWND hwnd, const std::wstring& message, bool success) {
     g_app->settingsActionFeedback = message;
     g_app->settingsActionFeedbackSuccess = success;
+    if (g_app->settingsTab == kSettingsSyncPage) {
+        // 同步页反馈画在标题下方的固定条带（内容区内），回滚到页顶避免被滚动内容盖住
+        g_app->settingsScrollOffset = 0;
+    }
     SetTimer(hwnd, kSettingsActionFeedbackTimer, kSettingsActionFeedbackMs, nullptr);
     InvalidateRect(hwnd, nullptr, FALSE);
 }
@@ -13658,6 +13770,12 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             handleSyncPeersResult(hwnd);
             return 0;
         }
+        if (message == kSyncProbeResultMessage) {
+            if (g_app && g_app->settingsTab == kSettingsSyncPage) {
+                refreshSyncStatusControl(hwnd);
+            }
+            return 0;
+        }
         if (message == WM_TIMER && wParam == kSettingsDropdownTimer) {
             if (!g_app->languageDropdown) {
                 KillTimer(hwnd, kSettingsDropdownTimer);
@@ -13952,6 +14070,15 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 long maximum = 0;
                 if (!settingsNumericEditRange(LOWORD(wParam), minimum, maximum)) {
                     scheduleSettingsSync(hwnd);
+                    if (LOWORD(wParam) == kSettingSyncServer) {
+                        // 地址被修改：旧的探测结果失效，立即重置并刷新状态行
+                        {
+                            std::lock_guard<std::mutex> lock(g_app->syncProbeMutex);
+                            g_app->syncProbeState = 0;
+                            g_app->syncProbeAt = 0;
+                        }
+                        refreshSyncStatusControl(hwnd);
+                    }
                 }
                 return 0;
             }

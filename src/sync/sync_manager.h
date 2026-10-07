@@ -129,6 +129,21 @@ public:
                                     const std::string& requestId, bool approve,
                                     std::string& errorUtf8);
 
+    // 房间成员（经由本机配对码加入的设备）
+    struct PeerInfo {
+        std::string deviceId;
+        std::string name;
+        std::int64_t createdAt = 0; // Unix 毫秒
+    };
+
+    // 列出经由本机配对码加入的设备（不含已移除）
+    static bool DevicePeerList(const std::wstring& serverUrl, const std::string& deviceToken,
+                               std::vector<PeerInfo>& out, std::string& errorUtf8);
+
+    // 移除（踢出）经由本机配对码加入的设备：吊销 token 并断开其连接
+    static bool DevicePeerRevoke(const std::wstring& serverUrl, const std::string& deviceToken,
+                                 const std::string& deviceId, std::string& errorUtf8);
+
     SyncState state() const { return state_.load(); }
     std::int64_t lastSeq() const { return lastSeq_.load(); }
 

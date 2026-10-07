@@ -699,4 +699,53 @@ bool SyncManager::DevicePendingDecide(const std::wstring& serverUrl, const std::
     return true;
 }
 
+bool SyncManager::DevicePeerList(const std::wstring& serverUrl, const std::string& deviceToken,
+                                 std::vector<PeerInfo>& out, std::string& errorUtf8) {
+    out.clear();
+    int status = 0;
+    std::string response;
+    if (!restCall(serverUrl, L"GET", L"/v1/device/peers", {}, deviceToken,
+                  status, response, errorUtf8)) {
+        return false;
+    }
+    JValue json;
+    if (!parseJson(response, json) || !json.isObject()) {
+        errorUtf8 = "服务端响应解析失败";
+        return false;
+    }
+    if (status != 200) {
+        errorUtf8 = errorFromResponse(status, response);
+        return false;
+    }
+    const JValue& list = json.at("peers");
+    if (!list.isArray()) {
+        errorUtf8 = "服务端响应缺少字段";
+        return false;
+    }
+    for (const JValue& item : list.arr) {
+        PeerInfo info;
+        info.deviceId = item.at("deviceId").asString();
+        info.name = item.at("name").asString();
+        info.createdAt = item.at("createdAt").asInt();
+        if (!info.deviceId.empty()) out.push_back(std::move(info));
+    }
+    return true;
+}
+
+bool SyncManager::DevicePeerRevoke(const std::wstring& serverUrl, const std::string& deviceToken,
+                                   const std::string& deviceId, std::string& errorUtf8) {
+    const std::string body = "{\"deviceId\":\"" + jsonEscape(deviceId) + "\"}";
+    int status = 0;
+    std::string response;
+    if (!restCall(serverUrl, L"POST", L"/v1/device/peers/revoke", body, deviceToken,
+                  status, response, errorUtf8)) {
+        return false;
+    }
+    if (status != 200) {
+        errorUtf8 = errorFromResponse(status, response);
+        return false;
+    }
+    return true;
+}
+
 } // namespace clipsync

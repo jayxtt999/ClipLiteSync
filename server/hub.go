@@ -136,6 +136,23 @@ func (h *Hub) drop(c *conn) {
 	}
 }
 
+// KickDevice 断开指定设备的全部 WS 连接（吊销后调用），返回断开的连接数
+func (h *Hub) KickDevice(deviceID string) int {
+	h.mu.Lock()
+	targets := make([]*conn, 0, len(h.conns))
+	for c := range h.conns {
+		if c.device != nil && c.device.ID == deviceID {
+			targets = append(targets, c)
+		}
+	}
+	h.mu.Unlock()
+	for _, c := range targets {
+		h.drop(c)
+		c.ws.Close() // 立即断开底层连接，客户端感知后重连会被 bad_token 拒绝
+	}
+	return len(targets)
+}
+
 func (h *Hub) broadcast(e *Event, except *conn) {
 	b, _ := json.Marshal(map[string]any{"v": 1, "type": "event", "seq": e.Seq, "byDevice": e.ByDevice, "event": e.Event})
 	h.mu.Lock()

@@ -71,6 +71,9 @@ type Device struct {
 	Token     string `json:"token"`
 	CreatedAt int64  `json:"createdAt"`
 	Revoked   bool   `json:"revoked"`
+	// CreatedBy 记录该设备由谁引入：邀请设备的 ID 或 "admin"（创始码）。
+	// 房主只能列表/踢出自己引入的设备。
+	CreatedBy string `json:"createdBy,omitempty"`
 }
 
 type DeviceStore struct {
@@ -104,14 +107,41 @@ func (ds *DeviceStore) saveLocked() error {
 	return os.Rename(tmp, ds.path)
 }
 
-func (ds *DeviceStore) Create(name string) (*Device, error) {
+func (ds *DeviceStore) Create(name, createdBy string) (*Device, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	id, _ := randomToken(8)
 	tok, _ := randomToken(32)
-	d := &Device{ID: "dev-" + id, Name: name, Token: tok, CreatedAt: time.Now().UnixMilli()}
+	d := &Device{ID: "dev-" + id, Name: name, Token: tok, CreatedAt: time.Now().UnixMilli(),
+		CreatedBy: createdBy}
 	ds.Devices = append(ds.Devices, d)
 	return d, ds.saveLocked()
+}
+
+// FindByID 按 ID 查找设备（含已吊销）
+func (ds *DeviceStore) FindByID(id string) *Device {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	for _, d := range ds.Devices {
+		if d.ID == id {
+			return d
+		}
+	}
+	return nil
+}
+
+// ListByCreator 返回某设备引入的全部未吊销设备（不含其自身）
+func (ds *DeviceStore) ListByCreator(creatorID string) []*Device {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	var out []*Device
+	for _, d := range ds.Devices {
+		if d.CreatedBy == creatorID && !d.Revoked {
+			out = append(out, d)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
+	return out
 }
 
 func (ds *DeviceStore) FindByToken(token string) *Device {
@@ -132,6 +162,19 @@ func (ds *DeviceStore) List() []*Device {
 	copy(out, ds.Devices)
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
 	return out
+}
+
+// SetCreatedBy 更新设备的引入人（测试/管理用途）
+func (ds *DeviceStore) SetCreatedBy(id, createdBy string) bool {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	for _, d := range ds.Devices {
+		if d.ID == id {
+			d.CreatedBy = createdBy
+			return ds.saveLocked() == nil
+		}
+	}
+	return false
 }
 
 func (ds *DeviceStore) Revoke(id string) bool {
@@ -279,6 +322,8 @@ func main() {
 	mux.HandleFunc("/v1/device/join/status", srv.handleJoinStatus)
 	mux.HandleFunc("/v1/device/pending", srv.handleDevicePending)
 	mux.HandleFunc("/v1/device/pending/decide", srv.handlePendingDecide)
+	mux.HandleFunc("/v1/device/peers", srv.handleDevicePeers)
+	mux.HandleFunc("/v1/device/peers/revoke", srv.handleDevicePeerRevoke)
 	mux.HandleFunc("/ws", srv.handleWS)
 
 	log.Printf("ClipSync server 监听 :%s（数据目录 %s）", cfg.Port, cfg.DataDir)

@@ -250,7 +250,7 @@ func (s *Server) handleDeviceJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	// 创始码（管理员生成）：无确认人，直接建号
 	if inv.CreatedBy == "admin" {
-		d, err := s.devices.Create(req.DeviceName)
+		d, err := s.devices.Create(req.DeviceName, "admin")
 		if err != nil {
 			respond(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -342,7 +342,8 @@ func (s *Server) handlePendingDecide(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]string{"ok": "rejected"})
 		return
 	}
-	d, err := s.devices.Create(p.Name)
+	// 记录引入关系：房主可在此后列表/踢出该设备
+	d, err := s.devices.Create(p.Name, device.ID)
 	if err != nil {
 		respond(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -350,6 +351,71 @@ func (s *Server) handlePendingDecide(w http.ResponseWriter, r *http.Request) {
 	p.Status = "approved"
 	p.DeviceID = d.ID
 	p.DeviceToken = d.Token
-	log.Printf("[pair] %s 允许 %s 加入（新设备 %s）", device.ID, p.Name, d.ID)
+	log.Printf("[pair] %s 允许 %s 加入（新设备 %s，由 %s 引入）", device.ID, p.Name, d.ID, device.ID)
 	respond(w, 200, map[string]string{"ok": "approved", "deviceId": d.ID})
+}
+
+// GET /v1/device/peers —— 列出经由本机配对码加入的设备（不含已吊销）
+func (s *Server) handleDevicePeers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respond(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	device := s.authDevice(r)
+	if device == nil {
+		respond(w, 401, map[string]string{"error": "设备 token 无效"})
+		return
+	}
+	list := s.devices.ListByCreator(device.ID)
+	type item struct {
+		DeviceID  string `json:"deviceId"`
+		Name      string `json:"name"`
+		CreatedAt int64  `json:"createdAt"`
+	}
+	out := make([]item, 0, len(list))
+	for _, d := range list {
+		out = append(out, item{DeviceID: d.ID, Name: d.Name, CreatedAt: d.CreatedAt})
+	}
+	respond(w, 200, map[string]any{"peers": out})
+}
+
+// POST /v1/device/peers/revoke —— 房主移除（踢出）自己引入的设备
+func (s *Server) handleDevicePeerRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respond(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	device := s.authDevice(r)
+	if device == nil {
+		respond(w, 401, map[string]string{"error": "设备 token 无效"})
+		return
+	}
+	var req struct {
+		DeviceID string `json:"deviceId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.DeviceID == "" {
+		respond(w, 400, map[string]string{"error": "请求格式错误"})
+		return
+	}
+	target := s.devices.FindByID(req.DeviceID)
+	if target == nil || target.Revoked {
+		respond(w, 404, map[string]string{"error": "设备不存在或已移除"})
+		return
+	}
+	if target.ID == device.ID {
+		respond(w, 403, map[string]string{"error": "不能移除本机，请使用解除配对"})
+		return
+	}
+	if target.CreatedBy != device.ID {
+		respond(w, 403, map[string]string{"error": "只能移除经由本机配对码加入的设备"})
+		return
+	}
+	if !s.devices.Revoke(target.ID) {
+		respond(w, 500, map[string]string{"error": "移除失败"})
+		return
+	}
+	// 踢下线：立即断开其 WS 连接（其 token 已吊销，无法重连）
+	kicked := s.hub.KickDevice(target.ID)
+	log.Printf("[pair] %s 移除设备 %s(%s)，踢下线 %d 个连接", device.ID, target.Name, target.ID, kicked)
+	respond(w, 200, map[string]any{"ok": true, "kicked": kicked})
 }

@@ -36,6 +36,10 @@ func httpHandler(s *Server) http.Handler {
 	mux.HandleFunc("/v1/admin/devices", s.handleAdminDevices)
 	mux.HandleFunc("/v1/admin/devices/", s.handleAdminRevoke)
 	mux.HandleFunc("/v1/device/join", s.handleDeviceJoin)
+	mux.HandleFunc("/v1/device/pending", s.handleDevicePending)
+	mux.HandleFunc("/v1/device/pending/decide", s.handlePendingDecide)
+	mux.HandleFunc("/v1/device/peers", s.handleDevicePeers)
+	mux.HandleFunc("/v1/device/peers/revoke", s.handleDevicePeerRevoke)
 	mux.HandleFunc("/ws", s.handleWS)
 	return mux
 }
@@ -46,7 +50,7 @@ func wsURL(httpURL string) string {
 
 func joinDevice(t *testing.T, s *Server, name string) *Device {
 	t.Helper()
-	d, err := s.devices.Create(name)
+	d, err := s.devices.Create(name, "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,8 +254,97 @@ func TestRevokedTokenRejected(t *testing.T) {
 	}
 }
 
-func TestRingBufferEviction(t *testing.T) {
-	cfg := loadConfig()
+// 设备侧"房间成员"接口：列表只含自己引入的设备，且只能移除自己引入的设备。
+func TestDevicePeersListAndRevoke(t *testing.T) {
+	s, ts := newTestServer(t)
+	owner := joinDevice(t, s, "pc-owner")
+	peer := joinDevice(t, s, "pc-peer")
+	peer.CreatedBy = owner.ID
+	if !s.devices.SetCreatedBy(peer.ID, owner.ID) {
+		t.Fatal("SetCreatedBy 失败")
+	}
+	stranger := joinDevice(t, s, "pc-stranger")
+
+	authed := func(method, path, token, body string) (int, map[string]any) {
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+
+	// owner 列表：只有 pc-peer
+	code, out := authed("GET", "/v1/device/peers", owner.Token, "")
+	if code != 200 {
+		t.Fatalf("peers 应 200，得到 %d", code)
+	}
+	peers := out["peers"].([]any)
+	if len(peers) != 1 || peers[0].(map[string]any)["deviceId"] != peer.ID {
+		t.Fatalf("owner 应只看到自己引入的设备: %v", out)
+	}
+	// stranger 的列表为空
+	code, out = authed("GET", "/v1/device/peers", stranger.Token, "")
+	if code != 200 || len(out["peers"].([]any)) != 0 {
+		t.Fatalf("stranger 应无 peers: %d %v", code, out)
+	}
+
+	// 被踢设备先建立 WS 连接
+	ws, ch := dial(t, ts, peer.Token, 0)
+	defer ws.Close()
+
+	// 不能移除本机、不能移除非自己引入的设备
+	code, _ = authed("POST", "/v1/device/peers/revoke", owner.Token,
+		`{"deviceId":"`+owner.ID+`"}`)
+	if code != 403 {
+		t.Fatalf("移除本机应 403，得到 %d", code)
+	}
+	code, _ = authed("POST", "/v1/device/peers/revoke", owner.Token,
+		`{"deviceId":"`+stranger.ID+`"}`)
+	if code != 403 {
+		t.Fatalf("移除非引入设备应 403，得到 %d", code)
+	}
+
+	// 正常移除：200，且其 WS 被断开
+	code, out = authed("POST", "/v1/device/peers/revoke", owner.Token,
+		`{"deviceId":"`+peer.ID+`"}`)
+	if code != 200 || out["ok"] != true {
+		t.Fatalf("移除引入设备应 200: %d %v", code, out)
+	}
+	if kicked, ok := out["kicked"].(float64); !ok || kicked < 1 {
+		t.Fatalf("应有至少 1 个连接被踢下线: %v", out)
+	}
+	// 被踢设备：要么收到错误帧，要么连接被直接断开（均为踢下线表现）
+	select {
+	case b, ok := <-ch:
+		if ok {
+			var f map[string]any
+			_ = json.Unmarshal(b, &f)
+			if f["type"] == "error" && f["code"] != "bad_token" {
+				t.Fatalf("被踢设备应收到 bad_token 或直接断开: %v", f)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("被踢设备的连接未在 2 秒内断开")
+	}
+
+	// 移除后列表为空、重复移除 404
+	code, out = authed("GET", "/v1/device/peers", owner.Token, "")
+	if code != 200 || len(out["peers"].([]any)) != 0 {
+		t.Fatalf("移除后 peers 应为空: %v", out)
+	}
+	code, _ = authed("POST", "/v1/device/peers/revoke", owner.Token,
+		`{"deviceId":"`+peer.ID+`"}`)
+	if code != 404 {
+		t.Fatalf("重复移除应 404，得到 %d", code)
+	}
+}
+
+func TestRingBufferEviction(t *testing.T) {	cfg := loadConfig()
 	cfg.BufferEvents = 3
 	rb := NewRingBuffer(cfg)
 	for i := int64(1); i <= 5; i++ {

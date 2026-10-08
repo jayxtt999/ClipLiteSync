@@ -142,6 +142,9 @@ constexpr int kSettingSyncUnpair = 84;
 constexpr int kSettingSyncStatus = 85;   // 设备状态（SS_OWNERDRAW 静态文本，按状态着色）
 constexpr int kSettingSyncGenCode = 86;  // 生成配对码（房主）
 constexpr int kSettingSyncCodeBox = 87;  // 配对码展示（只读）
+constexpr int kSettingSyncRotate = 140;  // 变更验证码（撤销旧码并踢出旧设备）
+constexpr int kSettingSyncCodeEye = 142; // 验证码显示/隐藏（眼睛图标）
+constexpr int kSettingSyncReconnect = 143; // 手动重连（重新建立与服务器的连接）
 // 动态按钮槽位：待确认申请 接受/拒绝 × 4、房间成员 移除 × 4
 constexpr int kSyncDynamicSlots = 4;
 constexpr int kSettingSyncApproveBase = 88; // +0..3 接受
@@ -306,7 +309,7 @@ constexpr int kSupportQqWidth = 560;
 constexpr int kSupportQqHeight = 700;
 constexpr std::size_t kPopupImagePreviewCacheLimit = 24;
 constexpr std::size_t kPopupSourceIconCacheLimit = 32;
-constexpr char kCurrentVersion[] = "1.4.0";
+constexpr char kCurrentVersion[] = "2.0.1";
 constexpr wchar_t kSourceUrl[] = L"https://github.com/wxh-777/ClipLite";
 constexpr wchar_t kLatestReleaseApiUrl[] =
     L"https://api.github.com/repos/wxh-777/ClipLite/releases/latest";
@@ -641,8 +644,10 @@ struct AppState {
     bool syncGenRegistered = false;      // 本次生成前执行了开放注册（结果含新 token）
     std::string syncGenRegDeviceId;
     std::string syncGenRegToken;
-    std::string syncGenCode;             // 房主：最近生成的配对码
+    std::string syncGenCode;             // 房主：最近生成的验证码
     std::string syncGenError;
+    bool syncGenRotate = false;          // 房主：本次是否为变更验证码（撤销旧码踢旧设备）
+    bool syncCodeHidden = true;          // 验证码展示框是否隐藏（眼睛图标状态）
     std::string syncJoinRequestId;       // 加入方：待确认申请 ID（空=无）
     bool syncJoinPollBusy = false;       // 加入方：轮询进行中
     bool syncJoinPollHas = false;        // 加入方：轮询结果就绪
@@ -1315,7 +1320,7 @@ const SettingsLocale kEnglishSettingsLocale{
      L"Some shortcuts could not be registered. Choose different combinations.",
     L"Custom shortcuts require at least one modifier key.",
     L"Sensitive markers: password, token, api_key, secret, and private keys; detected by content pattern.",
-        L"Application    ClipLiteSync", L"Version        1.4.0 x64", L"Storage format  v4",
+        L"Application    ClipLiteSync", L"Version        2.0.1 x64", L"Storage format  v4",
      L"Data directory  %LOCALAPPDATA%\\ClipLite", L"Browse", L"Clear unpinned history", L"Clear unpinned text",
      L"Clear unpinned images", L"Clear unpinned files", L"Press shortcut", L"Need modifier", L"One application per line", L"Auto",
     L"ClipLiteSync Settings", L"Choose a valid cache directory.", L"Unable to create the cache directory.",
@@ -1366,7 +1371,7 @@ const SettingsLocale kChineseSettingsLocale{
      L"无法注册“%ls”（%ls），可能已被其他程序或 Windows 占用，已恢复为 %ls。",
      L"部分快捷键注册失败，请更换组合键。", L"自定义快捷键至少需要一个修饰键。",
     L"敏感标记：password、token、api_key、secret 和私钥；按内容格式检测。",
-          L"应用名称    ClipLiteSync", L"版本        1.4.0 x64", L"存储格式    v4",
+          L"应用名称    ClipLiteSync", L"版本        2.0.1 x64", L"存储格式    v4",
      L"数据目录    %LOCALAPPDATA%\\ClipLite", L"浏览", L"清理未置顶历史", L"清理未置顶文本", L"清理未置顶图片",
       L"清理未置顶文件", L"按下组合键", L"需要修饰键", L"每行一个应用名称", L"自动", L"ClipLiteSync 设置",
     L"请选择有效的缓存目录。", L"无法创建缓存目录。", L"目标目录已有历史数据，请选择空目录。",
@@ -1503,16 +1508,50 @@ bool buildFileBundle(const std::string& payload, clipsync::SyncEvent& event) {
 }
 
 // 本机剪贴板入库成功后发布同步事件（在 storage worker 线程调用，SyncManager 内部排队）
+// Html 类型 payload 提取纯文本：优先取 StoredHtmlHeader 里的 text 部分；为空则剥 HTML 标签。
+// （实现见 splitStoredHtml 定义之后，此处前置声明供 publishClipAddSync 调用）
+static std::string syncPlainTextFromHtml(const std::string& payload);
+// DIB(CF_DIB/CF_DIBV5) → 标准 PNG（WIC 编码；实现见 validateDibPayload 之后）
+static std::string encodeDibToPng(const std::string& payload);
+
 void publishClipAddSync(ClipType type, const std::string& payload, std::uint64_t hash,
                         const std::string& source) {
     if (!g_app || !g_app->settingsData.syncEnabled) return;
     clipsync::SyncEvent event;
     event.kind = "clip.add";
+    // Html 类型：payload 是「纯文本 + CF_HTML」混合结构（含 Version:0.9/StartHTML 头 + 标签），
+    // 直接发给移动端会被当纯文本显示成 HTML$ 乱码。同步时提取纯文本、降级为 Text(1)，
+    // 保持移动端只接收可读文本（本机历史仍保留富文本原样）。
+    if (type == ClipType::Html) {
+        const std::string plain = syncPlainTextFromHtml(payload);
+        if (plain.empty()) return;
+        event.clipType = static_cast<int>(ClipType::Text);
+        event.hash = clipLiteHash(plain);
+        event.sourceApp = source;
+        event.ts = clipsync::unixNowMs();
+        event.payload = plain;
+        const bool accepted = g_app->sync.Publish(event);
+        appendDiagnosticLog(accepted ? "INFO" : "WARN",
+                            accepted ? "sync: clip.add (html→text) published"
+                                     : "sync: publish rejected (offline/outbox full/oversized)");
+        return;
+    }
     event.clipType = static_cast<int>(type);
     event.hash = hash;
     event.sourceApp = source;
     event.ts = clipsync::unixNowMs();
-    if (type == ClipType::Files) {
+    if (type == ClipType::Image || type == ClipType::ImageV5) {
+        // 图片 payload 是 Windows 原生 DIB，Android 无法解码（预览/保存全坏）。
+        // 发送前转码为标准 PNG，clipType 统一为 3；转码失败则仅本机保留（无 payload 远端会忽略）。
+        const std::string png = encodeDibToPng(payload);
+        if (png.empty()) {
+            event.localOnly = true;
+            appendDiagnosticLog("WARN", "sync: image DIB→PNG encode failed, kept local only");
+        } else {
+            event.clipType = static_cast<int>(ClipType::Image);
+            event.payload = png;
+        }
+    } else if (type == ClipType::Files) {
         // 小文件打包 zip 同步；缺失/目录/超限则退回"仅本机"标记
         if (!buildFileBundle(payload, event)) event.localOnly = true;
     } else {
@@ -1614,6 +1653,11 @@ void refreshSyncStatusControl(HWND hwnd) {
                 text = languageIsChinese() ? L"未配对 · 正在检查服务器..." : L"Not paired · checking server...";
             }
         }
+    } else if (s.syncServer.empty()) {
+        // 已有配对身份但服务器地址被清空：不能算已配对，也不能启动同步
+        text = languageIsChinese() ? L"未配置服务器地址：请在上方填写后重连"
+                                   : L"Server address not set: fill it in above, then reconnect";
+        kind = 3;
     } else {
         text = languageIsChinese() ? L"已配对" : L"Paired";
         if (!s.syncEnabled) {
@@ -1798,9 +1842,39 @@ void handleSyncPairResult(HWND hwnd) {
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
-// 生成配对码（房主，后台线程）。未配对但已填服务器地址时，先开放注册本机
-// （自成一个新房间，无需管理员创始码），再生成配对码。
-void handleSyncGenCodeClicked(HWND hwnd) {
+// 手动重连：重新按当前设置（服务器地址 + token）启动同步连接。
+// 用于离线后主动重试、或填好服务器地址后立即生效，无需重启程序。
+void handleSyncReconnectClicked(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    const Settings& s = g_app->settingsData;
+    if (s.syncServer.empty()) {
+        setSettingsActionFeedback(hwnd,
+            tr(L"Enter the server address above first (e.g. ws://192.168.1.10:8765).",
+               L"请先在上方填写服务器地址，例如 ws://192.168.1.10:8765。"), false);
+        refreshSyncStatusControl(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+    if (s.syncToken.empty()) {
+        setSettingsActionFeedback(hwnd,
+            tr(L"This device is not paired yet. Click \"Generate pair code\" to create a "
+               L"room, or enter a pair code and click \"Join\".",
+               L"本机尚未配对。请点「生成配对码」创建房间，或填配对码后点「加入」。"), false);
+        refreshSyncStatusControl(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+    applySyncSettings();
+    refreshSyncStatusControl(hwnd);
+    setSettingsActionFeedback(hwnd,
+        tr(L"Reconnecting…", L"正在重连…"), true);
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// 生成验证码（房主，后台线程）。未配对但已填服务器地址时，先开放注册本机
+// （自成一个新房间，无需管理员创始码），再生成验证码。
+// rotate=true 表示变更验证码：服务端撤销旧码并踢出旧码加入的全部设备。
+void handleSyncGenCodeClicked(HWND hwnd, bool rotate) {
     if (!g_app || !hwnd) return;
     std::string token;
     std::string server;
@@ -1831,6 +1905,23 @@ void handleSyncGenCodeClicked(HWND hwnd) {
         InvalidateRect(hwnd, nullptr, FALSE);
         return;
     }
+    // 已配对时点「生成配对码」＝重新生成新验证码，会撤销旧码并解绑下线已绑定的设备组。
+    // 与「变更验证码」行为一致，必须二次确认，避免用户误点导致整组设备被踢下线。
+    if (!token.empty() && !rotate) {
+        const int confirm = MessageBoxW(hwnd,
+            tr(L"This will generate a new pair code and unbind all devices currently "
+               L"joined to this room (they will be disconnected and must re-join with "
+               L"the new code). Continue?",
+               L"重新生成配对码会撤销当前验证码，并解绑下线已加入本设备组的所有设备"
+               L"（对方需用新验证码重新加入）。是否继续？"),
+            L"ClipLiteSync", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+        if (confirm != IDYES) return;
+        rotate = true; // 确认后按「变更验证码」语义执行：撤销旧码 + 踢出旧设备
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        g_app->syncGenRotate = rotate;
+    }
     wchar_t computerName[MAX_COMPUTERNAME_LENGTH + 1]{};
     DWORD nameLength = ARRAYSIZE(computerName);
     if (!GetComputerNameW(computerName, &nameLength) || nameLength == 0) {
@@ -1855,7 +1946,7 @@ void handleSyncGenCodeClicked(HWND hwnd) {
                  L"正在向服务端注册本机并创建新房间…")
             : tr(L"Generating pair code…", L"正在生成配对码…"), true);
     const HWND settingsWindow = hwnd;
-    std::thread([settingsWindow, server, token, deviceName] {
+    std::thread([settingsWindow, server, token, deviceName, rotate] {
         using clipsync::SyncManager;
         std::string activeToken = token;
         std::string deviceId;
@@ -1872,14 +1963,28 @@ void handleSyncGenCodeClicked(HWND hwnd) {
             if (registered) {
                 activeToken = newToken;
                 ok = SyncManager::DeviceInvite(utf8ToWide(server), activeToken,
-                                               code, expiresAt, error);
+                                               code, expiresAt, error, false);
                 if (!ok && !newToken.empty()) {
                     // 注册成功但生成码失败：token 仍保留，下次点击直接生成
                 }
             }
         } else {
             ok = SyncManager::DeviceInvite(utf8ToWide(server), activeToken,
-                                           code, expiresAt, error);
+                                           code, expiresAt, error, rotate);
+            if (!ok && !rotate) {
+                // 本机 token 可能已失效（服务端数据被重置等）。降级为开放注册：
+                // register 按机器码去重，同机复用原身份、否则创建新身份，再重新生成码。
+                std::string fallbackErr;
+                registered = SyncManager::DeviceRegister(utf8ToWide(server), deviceName,
+                                                         deviceId, newToken, fallbackErr);
+                if (registered) {
+                    activeToken = newToken;
+                    ok = SyncManager::DeviceInvite(utf8ToWide(server), activeToken,
+                                                   code, expiresAt, error, false);
+                } else if (error.empty()) {
+                    error = fallbackErr;
+                }
+            }
         }
         if (g_app) {
             std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
@@ -1894,11 +1999,12 @@ void handleSyncGenCodeClicked(HWND hwnd) {
     }).detach();
 }
 
-// 配对码生成结果（UI 线程）
+// 验证码生成结果（UI 线程）
 void handleSyncGenCodeResult(HWND hwnd) {
     if (!g_app || !hwnd) return;
     bool ok = false;
     bool registered = false;
+    bool rotate = false;
     std::string code;
     std::string error;
     std::string regDeviceId;
@@ -1907,6 +2013,7 @@ void handleSyncGenCodeResult(HWND hwnd) {
         std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
         ok = !g_app->syncGenCode.empty();
         registered = g_app->syncGenRegistered;
+        rotate = g_app->syncGenRotate;
         code = g_app->syncGenCode;
         error = g_app->syncGenError;
         regDeviceId = g_app->syncGenRegDeviceId;
@@ -1923,23 +2030,60 @@ void handleSyncGenCodeResult(HWND hwnd) {
         }
         applySyncSettings();
     }
+    // 生成/变更成功后，验证码默认隐藏（眼睛图标控制显示）
+    g_app->syncCodeHidden = true;
     if (HWND box = settingsControl(hwnd, kSettingSyncCodeBox)) {
-        SetWindowTextW(box, ok ? utf8ToWide(code).c_str()
-                               : tr(L"Failed", L"生成失败"));
+        if (ok) {
+            const std::wstring codeW = utf8ToWide(code);
+            SetWindowTextW(box, g_app->syncCodeHidden
+                ? std::wstring(codeW.size(), L'●').c_str() : codeW.c_str());
+        } else {
+            SetWindowTextW(box, tr(L"Failed", L"生成失败"));
+        }
     }
     if (ok) {
         setSettingsActionFeedback(hwnd,
             registered
-                ? tr(L"This device is registered as a new room. Pair code generated, "
-                     L"valid for 10 minutes, one-time use.",
-                     L"本机已注册为新房间，配对码已生成：10 分钟内有效，一次性使用。")
-                : tr(L"Pair code generated. Valid for 10 minutes, one-time use.",
-                     L"配对码已生成：10 分钟内有效，一次性使用。"), true);
+                ? tr(L"This device is registered as a new room. A permanent invite code "
+                     L"has been generated (reusable, never expires).",
+                     L"本机已注册为新房间，永久验证码已生成（可重复使用，长期有效）。")
+                : (rotate
+                    ? tr(L"Invite code rotated. Old code revoked and previously joined "
+                         L"devices have been kicked out.",
+                         L"验证码已变更：旧码已失效，通过旧码加入的设备已被踢出。")
+                    : tr(L"A permanent invite code has been generated (reusable, never expires).",
+                         L"永久验证码已生成（可重复使用，长期有效）。")), true);
     } else {
         setSettingsActionFeedback(hwnd,
             tr(L"Generate pair code failed: ", L"生成配对码失败：") + utf8ToWide(error), false);
     }
     refreshSyncStatusControl(hwnd);
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+// 眼睛图标：切换验证码显示/隐藏
+void toggleSyncCodeVisibility(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    std::string code;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        code = g_app->syncGenCode;
+    }
+    if (code.empty()) {
+        setSettingsActionFeedback(hwnd, tr(L"No invite code yet", L"尚未生成验证码"), false);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
+    g_app->syncCodeHidden = !g_app->syncCodeHidden;
+    if (HWND box = settingsControl(hwnd, kSettingSyncCodeBox)) {
+        const std::wstring codeW = utf8ToWide(code);
+        SetWindowTextW(box, g_app->syncCodeHidden
+            ? std::wstring(codeW.size(), L'●').c_str() : codeW.c_str());
+    }
+    if (HWND eye = settingsControl(hwnd, kSettingSyncCodeEye)) {
+        SetWindowTextW(eye, tr(g_app->syncCodeHidden ? L"Show" : L"Hide",
+                               g_app->syncCodeHidden ? L"显示" : L"隐藏"));
+    }
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
@@ -3136,6 +3280,23 @@ bool splitStoredHtml(const std::string& payload, std::string& text, std::string&
     return !html.empty();
 }
 
+// Html 类型 payload 提取纯文本：优先取 StoredHtmlHeader 里的 text 部分；为空则剥 HTML 标签。
+static std::string syncPlainTextFromHtml(const std::string& payload) {
+    std::string text, html;
+    if (splitStoredHtml(payload, text, html) && !text.empty()) return text;
+    // 无纯文本段落：对整段（或 html 部分）剥标签
+    const std::string& src = html.empty() ? payload : html;
+    std::string out;
+    out.reserve(src.size());
+    bool inTag = false;
+    for (const char c : src) {
+        if (c == '<') inTag = true;
+        else if (c == '>') inTag = false;
+        else if (!inTag) out.push_back(c);
+    }
+    return out;
+}
+
 std::uint64_t clipboardDedupHash(ClipType type, const std::string& payload) {
     if (type != ClipType::Html) return clipLiteHash(payload);
     std::string text;
@@ -3210,6 +3371,161 @@ bool validateDibPayload(const std::string& payload, DibLayout* layout) {
 
 bool isValidDibPayload(const std::string& payload) {
     return validateDibPayload(payload, nullptr);
+}
+
+// 把 DIB payload（CF_DIB/CF_DIBV5，Windows 原生位图内存布局）编码为标准 PNG。
+// Android/跨平台无法解码 DIB，同步发送前必须转码；失败返回空串。
+// 像素路径与 createDibImagePreview 一致：无有效 alpha 时 StretchDIBits 由 GDI 处理
+// 全部格式（调色板/位域/行序），有 V5 alpha 时手动拷贝 straight BGRA，最后 WIC 编 PNG。
+std::string encodeDibToPng(const std::string& payload) {
+    DibLayout layout{};
+    if (!validateDibPayload(payload, &layout)) return {};
+    BITMAPINFOHEADER header{};
+    std::memcpy(&header, payload.data(), sizeof(header));
+    const int width = header.biWidth;
+    const int height = static_cast<int>(std::llabs(static_cast<long long>(header.biHeight)));
+
+    BITMAPINFO outputInfo{};
+    outputInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    outputInfo.bmiHeader.biWidth = width;
+    outputInfo.bmiHeader.biHeight = -height;   // top-down
+    outputInfo.bmiHeader.biPlanes = 1;
+    outputInfo.bmiHeader.biBitCount = 32;
+    outputInfo.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(nullptr, &outputInfo, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bitmap || !bits) return {};
+
+    const auto channel = [](std::uint32_t pixel, DWORD mask, BYTE fallback) {
+        if (mask == 0) return fallback;
+        unsigned shift = 0;
+        while (((mask >> shift) & 1u) == 0) ++shift;
+        const std::uint32_t maximum = mask >> shift;
+        const std::uint32_t value = (pixel & mask) >> shift;
+        return static_cast<BYTE>((value * 255u + maximum / 2u) / maximum);
+    };
+    BITMAPV5HEADER v5{};
+    const bool hasAlphaMask = header.biBitCount == 32 &&
+        header.biSize >= sizeof(BITMAPV5HEADER) &&
+        (std::memcpy(&v5, payload.data(), sizeof(v5)), v5.bV5AlphaMask != 0);
+    bool hasAlpha = false;
+    if (hasAlphaMask) {
+        for (int y = 0; y < height && !hasAlpha; ++y) {
+            const int sourceRow = header.biHeight < 0 ? y : height - 1 - y;
+            for (int x = 0; x < width && !hasAlpha; ++x) {
+                std::uint32_t pixel = 0;
+                std::memcpy(&pixel, payload.data() + layout.bitsOffset +
+                    static_cast<std::size_t>(sourceRow) * layout.rowBytes +
+                    static_cast<std::size_t>(x) * sizeof(pixel), sizeof(pixel));
+                if (channel(pixel, v5.bV5AlphaMask, 0) != 0) hasAlpha = true;
+            }
+        }
+    }
+
+    bool drawn = false;
+    if (hasAlpha) {
+        BYTE* output = static_cast<BYTE*>(bits);
+        for (int y = 0; y < height; ++y) {
+            const int sourceRow = header.biHeight < 0 ? y : height - 1 - y;
+            BYTE* row = output + static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 4;
+            for (int x = 0; x < width; ++x) {
+                std::uint32_t pixel = 0;
+                std::memcpy(&pixel, payload.data() + layout.bitsOffset +
+                    static_cast<std::size_t>(sourceRow) * layout.rowBytes +
+                    static_cast<std::size_t>(x) * sizeof(pixel), sizeof(pixel));
+                row[x * 4 + 0] = channel(pixel, v5.bV5BlueMask, 0);
+                row[x * 4 + 1] = channel(pixel, v5.bV5GreenMask, 0);
+                row[x * 4 + 2] = channel(pixel, v5.bV5RedMask, 0);
+                row[x * 4 + 3] = channel(pixel, v5.bV5AlphaMask, 255);
+            }
+        }
+        drawn = true;
+    } else {
+        HDC dc = CreateCompatibleDC(nullptr);
+        if (dc) {
+            HGDIOBJ previous = SelectObject(dc, bitmap);
+            const int result = StretchDIBits(dc, 0, 0, width, height, 0, 0, width, height,
+                                             payload.data() + layout.bitsOffset,
+                                             reinterpret_cast<const BITMAPINFO*>(payload.data()),
+                                             DIB_RGB_COLORS, SRCCOPY);
+            SelectObject(dc, previous);
+            DeleteDC(dc);
+            if (result > 0 && result != GDI_ERROR) {
+                BYTE* output = static_cast<BYTE*>(bits);
+                for (std::size_t i = 3; i < static_cast<std::size_t>(width) * height * 4; i += 4) {
+                    output[i] = 255;
+                }
+                drawn = true;
+            }
+        }
+    }
+    if (!drawn) {
+        DeleteObject(bitmap);
+        return {};
+    }
+
+    // 32bpp top-down straight BGRA 像素 → WIC 内存位图 → PNG 编码
+    std::string png;
+    if (SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+        IWICImagingFactory* factory = nullptr;
+        IWICBitmap* wicBitmap = nullptr;
+        IWICBitmapLock* lock = nullptr;
+        IWICBitmapEncoder* encoder = nullptr;
+        IWICBitmapFrameEncode* frame = nullptr;
+        IStream* stream = nullptr;
+        do {
+            if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                        IID_PPV_ARGS(&factory))) ||
+                FAILED(factory->CreateBitmap(static_cast<UINT>(width), static_cast<UINT>(height),
+                                             GUID_WICPixelFormat32bppBGRA,
+                                             WICBitmapCacheOnDemand, &wicBitmap)) ||
+                FAILED(wicBitmap->Lock(nullptr, WICBitmapLockWrite, &lock))) break;
+            BYTE* data = nullptr;
+            UINT dataSize = 0;
+            UINT stride = 0;
+            if (FAILED(lock->GetDataPointer(&dataSize, &data)) ||
+                FAILED(lock->GetStride(&stride)) || !data) break;
+            const std::size_t rowBytes = static_cast<std::size_t>(width) * 4;
+            for (int y = 0; y < height; ++y) {
+                std::memcpy(data + static_cast<std::size_t>(y) * stride,
+                            static_cast<const BYTE*>(bits) + static_cast<std::size_t>(y) * rowBytes,
+                            rowBytes);
+            }
+            lock->Release();
+            lock = nullptr;
+            if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) ||
+                FAILED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) ||
+                FAILED(encoder->Initialize(stream, WICBitmapEncoderNoCache)) ||
+                FAILED(encoder->CreateNewFrame(&frame, nullptr)) ||
+                FAILED(frame->Initialize(nullptr)) ||
+                FAILED(frame->SetSize(static_cast<UINT>(width), static_cast<UINT>(height)))) break;
+            WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppBGRA;
+            if (FAILED(frame->SetPixelFormat(&pixelFormat)) ||
+                FAILED(frame->WriteSource(wicBitmap, nullptr)) ||
+                FAILED(frame->Commit()) ||
+                FAILED(encoder->Commit())) break;
+            STATSTG stat{};
+            if (FAILED(stream->Stat(&stat, STATFLAG_NONAME)) || stat.cbSize.QuadPart <= 0) break;
+            png.resize(static_cast<std::size_t>(stat.cbSize.QuadPart));
+            LARGE_INTEGER begin{};
+            if (FAILED(stream->Seek(begin, STREAM_SEEK_SET, nullptr))) { png.clear(); break; }
+            ULONG read = 0;
+            if (FAILED(stream->Read(png.data(), static_cast<ULONG>(png.size()), &read))) {
+                png.clear();
+            } else {
+                png.resize(read);
+            }
+        } while (false);
+        if (lock) lock->Release();
+        if (frame) frame->Release();
+        if (encoder) encoder->Release();
+        if (stream) stream->Release();
+        if (wicBitmap) wicBitmap->Release();
+        if (factory) factory->Release();
+        CoUninitialize();
+    }
+    DeleteObject(bitmap);
+    return png;
 }
 
 bool captureClipboard(HWND owner, ClipType& type, std::string& payload, std::string& source) {
@@ -8152,7 +8468,7 @@ SettingsLayout buildSettingsLayout(HWND hwnd) {
             makeSettingsRow(hwnd, tr(L"Server address", L"服务器地址"),
                             {kSettingSyncServer}, {360}, {30}, contentWidth),
             makeSettingsRow(hwnd, tr(L"Device status", L"设备状态"),
-                            {kSettingSyncStatus}, {390}, {30}, contentWidth)
+                            {kSettingSyncStatus, kSettingSyncReconnect}, {390, 90}, {30, 30}, contentWidth)
         });
         makeCard(tr(L"Join another device", L"加入其他设备"), {
             makeSettingsRow(hwnd, tr(L"Pair code", L"对方配对码"),
@@ -8168,7 +8484,9 @@ SettingsLayout buildSettingsLayout(HWND hwnd) {
         {
             std::vector<SettingsRowLayout> rows;
             rows.push_back(makeSettingsRow(hwnd, tr(L"Generate pair code", L"生成配对码"),
-                            {kSettingSyncGenCode, kSettingSyncCodeBox}, {108, 220}, {30, 30}, contentWidth));
+                            {kSettingSyncGenCode, kSettingSyncCodeBox, kSettingSyncCodeEye}, {108, 190, 44}, {30, 30, 30}, contentWidth));
+            rows.push_back(makeSettingsRow(hwnd, tr(L"Change code", L"变更验证码"),
+                            {kSettingSyncRotate}, {108}, {30}, contentWidth));
             if (pendingCount == 0) {
                 rows.push_back(makeSettingsRow(hwnd, tr(L"No pending requests", L"暂无待确认申请"),
                                                {}, {}, {}, contentWidth));
@@ -8183,12 +8501,16 @@ SettingsLayout buildSettingsLayout(HWND hwnd) {
             }
             rows.push_back(makeSettingsRow(
                 hwnd,
-                tr(L"Codes are valid for 10 minutes, single use. Requests appear in the "
-                   L"list below for you to approve or reject. If this device is not "
-                   L"paired yet, clicking the button registers it on the server and "
-                   L"creates a new room automatically.",
-                   L"配对码 10 分钟内有效、一次性使用。对方填码申请后会出现在下方待确认列表，由你决定允许或拒绝。"
-                   L"本机尚未配对时，点此按钮会自动在服务端注册并创建一个新房间。"),
+                tr(L"The invite code is permanent and reusable. Other devices enter it "
+                   L"to request joining; requests appear in the list below for you to "
+                   L"approve or reject. \"Change code\" revokes the old code and kicks "
+                   L"out all previously joined devices. If this device is not paired "
+                   L"yet, clicking generate registers it on the server and creates a "
+                   L"new room automatically.",
+                   L"验证码长期有效、可重复使用。对方填码申请后会出现在下方待确认列表，由你决定允许或拒绝。"
+                   L"本机尚未配对时，点「生成配对码」会自动在服务端注册并创建一个新房间。"
+                   L"已配对后，点「生成配对码」与「变更验证码」效果相同：都会重新生成新码，"
+                   L"并解绑下线已加入本设备组的所有设备（需二次确认）。"),
                 {}, {}, {}, contentWidth));
             makeCard(tr(L"Invite devices", L"邀请设备加入"), std::move(rows));
         }
@@ -9753,6 +10075,13 @@ void createSettingsControlsModern(HWND hwnd) {
                   ui(250), ui(30), parent,
                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncStatus)),
                   GetModuleHandleW(nullptr), nullptr);
+    // 手动重连按钮：离线/未配置时点此重新建立连接
+    CreateWindowW(L"BUTTON", tr(L"Reconnect", L"重连"),
+                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                  ui(778 - kSettingsSidebarWidth), ui(180 - kSettingsHeaderHeight),
+                  ui(90), ui(30), parent,
+                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncReconnect)),
+                  GetModuleHandleW(nullptr), nullptr);
     CreateWindowExW(0, L"EDIT", L"",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOHSCROLL,
                     ui(520 - kSettingsSidebarWidth), ui(220 - kSettingsHeaderHeight),
@@ -9774,9 +10103,22 @@ void createSettingsControlsModern(HWND hwnd) {
     CreateWindowExW(0, L"EDIT", L"",
                     WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL,
                     ui(636 - kSettingsSidebarWidth), ui(260 - kSettingsHeaderHeight),
-                    ui(220), ui(30), parent,
+                    ui(190), ui(30), parent,
                     reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncCodeBox)),
                     GetModuleHandleW(nullptr), nullptr);
+    CreateWindowW(L"BUTTON", tr(L"Change code", L"变更验证码"),
+                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                  ui(520 - kSettingsSidebarWidth), ui(298 - kSettingsHeaderHeight),
+                  ui(108), ui(30), parent,
+                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncRotate)),
+                  GetModuleHandleW(nullptr), nullptr);
+    // 眼睛图标：显示/隐藏验证码（用 ▸ 字符代替，因纯 Win32 无内置图标资源）
+    CreateWindowW(L"BUTTON", tr(L"Show", L"显示"),
+                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                  ui(834 - kSettingsSidebarWidth), ui(260 - kSettingsHeaderHeight),
+                  ui(44), ui(30), parent,
+                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingSyncCodeEye)),
+                  GetModuleHandleW(nullptr), nullptr);
     // 动态按钮槽位：待确认申请 接受/拒绝 × 4、房间成员 移除 × 4（布局按列表实际行数显示）
     for (int i = 0; i < kSyncDynamicSlots; ++i) {
         CreateWindowW(L"BUTTON", tr(L"Accept", L"接受"),
@@ -9969,6 +10311,8 @@ void updateSettingsTabControls(HWND hwnd, bool redraw) {
                         kSettingSyncEnabled, kSettingSyncServer, kSettingSyncInvite,
                         kSettingSyncPair, kSettingSyncUnpair, kSettingSyncStatus,
                         kSettingSyncGenCode, kSettingSyncCodeBox,
+                        kSettingSyncRotate, kSettingSyncCodeEye,
+                        kSettingSyncReconnect,
                         kSettingSyncApproveBase, kSettingSyncApproveBase + 1,
                         kSettingSyncApproveBase + 2, kSettingSyncApproveBase + 3,
                         kSettingSyncRejectBase, kSettingSyncRejectBase + 1,
@@ -11739,6 +12083,7 @@ bool isSettingsActionButton(int id) {
              id == kSettingThemeDuplicate || id == kSettingThemeSave || id == kSettingThemeDelete ||
            // 同步页按钮（owner-draw，缺了这里按钮不会绘制）
            id == kSettingSyncPair || id == kSettingSyncGenCode || id == kSettingSyncUnpair ||
+           id == kSettingSyncRotate || id == kSettingSyncCodeEye || id == kSettingSyncReconnect ||
            (id >= kSettingSyncApproveBase && id < kSettingSyncApproveBase + kSyncDynamicSlots) ||
            (id >= kSettingSyncRejectBase && id < kSettingSyncRejectBase + kSyncDynamicSlots) ||
            (id >= kSettingSyncKickBase && id < kSettingSyncKickBase + kSyncDynamicSlots);
@@ -14190,7 +14535,19 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 return 0;
             }
             if (LOWORD(wParam) == kSettingSyncGenCode && HIWORD(wParam) == BN_CLICKED) {
-                handleSyncGenCodeClicked(hwnd);
+                handleSyncGenCodeClicked(hwnd, false);
+                return 0;
+            }
+            if (LOWORD(wParam) == kSettingSyncRotate && HIWORD(wParam) == BN_CLICKED) {
+                handleSyncGenCodeClicked(hwnd, true);
+                return 0;
+            }
+            if (LOWORD(wParam) == kSettingSyncCodeEye && HIWORD(wParam) == BN_CLICKED) {
+                toggleSyncCodeVisibility(hwnd);
+                return 0;
+            }
+            if (LOWORD(wParam) == kSettingSyncReconnect && HIWORD(wParam) == BN_CLICKED) {
+                handleSyncReconnectClicked(hwnd);
                 return 0;
             }
             const int syncActionId = LOWORD(wParam);

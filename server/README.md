@@ -25,7 +25,7 @@ $env:CLIPSYNC_DATA_DIR = "./data"
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `CLIPSYNC_PORT` | 8765 | 监听端口 |
-| `CLIPSYNC_ADMIN_PASSWORD` | admin123（强制要求修改） | 管理员密码 |
+| `CLIPSYNC_ADMIN_PASSWORD` | （无默认值，不设置则管理面不可用） | 管理员密码 |
 | `CLIPSYNC_DATA_DIR` | ./data | 设备表 JSON 存放目录 |
 | `CLIPSYNC_MAX_MSG_MB` | 64 | 单条消息上限（MB） |
 | `CLIPSYNC_BUFFER_EVENTS` | 200 | 重连补发缓冲条数 |
@@ -40,11 +40,15 @@ $env:CLIPSYNC_DATA_DIR = "./data"
 
 ## 设备接入流程
 
+推荐**开放注册**（无需管理员参与）：设备在客户端填好服务器地址后点「生成配对码」，即自动 `POST /v1/device/register` 创建新房间并成为房主。其他设备填该房间的 8 位永久配对码申请加入，房主确认后发放 device_token。
+
+管理员创始码方式（备选，用于关闭开放注册时引导首台设备）：
+
 1. `POST /v1/admin/login`（密码）→ adminToken；
-2. `POST /v1/admin/invite`（Bearer adminToken）→ 6 位一次性邀请码（10 分钟有效）；
-3. `POST /v1/device/join` `{inviteCode, deviceName}` → `deviceToken`（一次性）；
+2. `POST /v1/admin/invite`（Bearer adminToken）→ 8 位永久创始码；
+3. `POST /v1/device/join` `{inviteCode, deviceName, machineId}` → `deviceToken`（创始码直接放行）；
 4. 客户端持 deviceToken 连接 `ws(s)://.../ws`。
-5. 吊销：`DELETE /v1/admin/devices/{deviceId}`，吊销后该设备下次握手即被拒。
+5. 吊销：`POST /v1/admin/devices/{deviceId}`，吊销后该设备下次握手即被拒。
 
 `cmd/smokews` 是一条链路的冒烟客户端（连接→发布→打印收到的帧），可用于部署后自检。
 

@@ -103,9 +103,11 @@ public:
         std::int64_t createdAt = 0; // Unix 毫秒
     };
 
-    // 已配对设备生成配对码；成功返回 true 并填 code（8 位）/ expiresAtMs
+    // 已配对设备生成永久验证码；成功返回 true 并填 code / expiresAtMs。
+    // rotate=true 表示变更验证码：服务端会撤销旧码并踢出旧码加入的全部设备。
     static bool DeviceInvite(const std::wstring& serverUrl, const std::string& deviceToken,
-                             std::string& code, std::int64_t& expiresAtMs, std::string& errorUtf8);
+                             std::string& code, std::int64_t& expiresAtMs, std::string& errorUtf8,
+                             bool rotate = false);
 
     // 开放注册：本机未配对时直接向服务端注册，自成一个新房间（无需管理员创始码）。
     // 成功返回 true 并填 deviceId/deviceToken；服务端可用 CLIPSYNC_DISABLE_REGISTER=1 关闭。

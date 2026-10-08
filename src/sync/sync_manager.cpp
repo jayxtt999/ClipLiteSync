@@ -39,6 +39,42 @@ void closeHandleSafe(void** handle) {
     }
 }
 
+// 硬件机器码：优先取 Windows 安装时生成的 MachineGuid（重装软件不变），
+// 失败则回退到系统盘卷序列号。用于设备去重，避免断开重连后列表出现重复终端。
+std::string readMachineGuid() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SOFTWARE\\Microsoft\\Cryptography", 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        wchar_t value[128]{};
+        DWORD size = sizeof(value);
+        if (RegQueryValueExW(key, L"MachineGuid", nullptr, nullptr,
+                             reinterpret_cast<BYTE*>(value), &size) == ERROR_SUCCESS) {
+            RegCloseKey(key);
+            // 转 UTF-8
+            int len = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+            std::string out(static_cast<std::size_t>(len > 0 ? len - 1 : 0), '\0');
+            if (len > 0) {
+                WideCharToMultiByte(CP_UTF8, 0, value, -1, &out[0], len, nullptr, nullptr);
+            }
+            return out;
+        }
+        RegCloseKey(key);
+    }
+    // 回退：系统盘卷序列号
+    DWORD serial = 0;
+    if (GetVolumeInformationW(L"C:\\", nullptr, 0, &serial, nullptr, nullptr, nullptr, 0)) {
+        char buf[16]{};
+        sprintf_s(buf, sizeof(buf), "vol-%08lx", serial);
+        return buf;
+    }
+    return "unknown";
+}
+
+std::string deviceMachineId() {
+    static const std::string id = readMachineGuid();
+    return id;
+}
+
 } // namespace
 
 // ---------- 生命周期 ----------
@@ -590,10 +626,12 @@ bool SyncManager::ServerPing(const std::wstring& serverUrl, std::string& errorUt
 }
 
 bool SyncManager::DeviceInvite(const std::wstring& serverUrl, const std::string& deviceToken,
-                               std::string& code, std::int64_t& expiresAtMs, std::string& errorUtf8) {
+                               std::string& code, std::int64_t& expiresAtMs, std::string& errorUtf8,
+                               bool rotate) {
+    const std::string body = rotate ? "{\"rotate\":true}" : "{}";
     int status = 0;
     std::string response;
-    if (!restCall(serverUrl, L"POST", L"/v1/device/invite", "{}", deviceToken,
+    if (!restCall(serverUrl, L"POST", L"/v1/device/invite", body, deviceToken,
                   status, response, errorUtf8)) {
         return false;
     }
@@ -618,7 +656,8 @@ bool SyncManager::DeviceInvite(const std::wstring& serverUrl, const std::string&
 bool SyncManager::DeviceRegister(const std::wstring& serverUrl, const std::string& deviceName,
                                  std::string& deviceId, std::string& deviceToken,
                                  std::string& errorUtf8) {
-    const std::string body = "{\"deviceName\":\"" + jsonEscape(deviceName) + "\"}";
+    const std::string body = "{\"deviceName\":\"" + jsonEscape(deviceName) +
+                             "\",\"machineId\":\"" + jsonEscape(deviceMachineId()) + "\"}";
     int status = 0;
     std::string response;
     if (!restCall(serverUrl, L"POST", L"/v1/device/register", body, {},
@@ -649,7 +688,8 @@ bool SyncManager::DeviceJoinRequest(const std::wstring& serverUrl, const std::st
                                     std::string& deviceToken, std::string& errorUtf8) {
     phase = JoinPhase::Requested;
     const std::string body = "{\"inviteCode\":\"" + jsonEscape(code) +
-                             "\",\"deviceName\":\"" + jsonEscape(deviceName) + "\"}";
+                             "\",\"deviceName\":\"" + jsonEscape(deviceName) +
+                             "\",\"machineId\":\"" + jsonEscape(deviceMachineId()) + "\"}";
     int status = 0;
     std::string response;
     if (!restCall(serverUrl, L"POST", L"/v1/device/join", body, {},

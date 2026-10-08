@@ -36,9 +36,13 @@ func httpHandler(s *Server) http.Handler {
 	mux.HandleFunc("/v1/admin/devices", s.handleAdminDevices)
 	mux.HandleFunc("/v1/admin/devices/", s.handleAdminRevoke)
 	mux.HandleFunc("/v1/device/join", s.handleDeviceJoin)
+	mux.HandleFunc("/v1/device/invite", s.handleDeviceInvite)
+	mux.HandleFunc("/v1/device/register", s.handleDeviceRegister)
+	mux.HandleFunc("/v1/device/join/status", s.handleJoinStatus)
 	mux.HandleFunc("/v1/device/pending", s.handleDevicePending)
 	mux.HandleFunc("/v1/device/pending/decide", s.handlePendingDecide)
 	mux.HandleFunc("/v1/device/peers", s.handleDevicePeers)
+	mux.HandleFunc("/v1/device/room", s.handleDeviceRoom)
 	mux.HandleFunc("/v1/device/peers/revoke", s.handleDevicePeerRevoke)
 	mux.HandleFunc("/ws", s.handleWS)
 	return mux
@@ -150,7 +154,7 @@ func TestAdminLoginAndInviteFlow(t *testing.T) {
 	}
 
 	// 创始码（管理员生成）：直接放行，返回 token
-	joinBody, _ := json.Marshal(map[string]string{"inviteCode": inv["inviteCode"], "deviceName": "pc-A"})
+	joinBody, _ := json.Marshal(map[string]string{"inviteCode": inv["inviteCode"], "deviceName": "pc-A", "machineId": "ADMIN-M1"})
 	code, body = httpPost(t, ts.URL+"/v1/device/join", joinBody, "")
 	if code != 200 {
 		t.Fatalf("设备加入应成功: %d", code)
@@ -161,9 +165,15 @@ func TestAdminLoginAndInviteFlow(t *testing.T) {
 		t.Fatal("缺少 deviceToken")
 	}
 
-	code, _ = httpPost(t, ts.URL+"/v1/device/join", joinBody, "")
-	if code != 403 {
-		t.Fatalf("邀请码应一次性，得到 %d", code)
+	// 创始码为永久验证码，可重复使用；同机器码复用同一设备
+	code, body = httpPost(t, ts.URL+"/v1/device/join", joinBody, "")
+	if code != 200 {
+		t.Fatalf("创始码应可重复使用，得到 %d", code)
+	}
+	var dev2 map[string]string
+	json.Unmarshal(body, &dev2)
+	if dev2["deviceId"] != dev["deviceId"] {
+		t.Fatalf("同机器码应复用同一设备: %s vs %s", dev2["deviceId"], dev["deviceId"])
 	}
 
 	// 未授权访问管理接口
@@ -416,4 +426,169 @@ func TestRoomIsolation(t *testing.T) {
 	case <-time.After(800 * time.Millisecond):
 		// 符合预期：隔离生效
 	}
+}
+
+
+// 永久验证码：随机生成、可重复使用、变更码踢旧设备、机器码去重
+func TestPermanentInviteAndMachineDedup(t *testing.T) {
+	s, ts := newTestServer(t)
+	owner := joinDevice(t, s, "pc-owner")
+
+	authed := func(method, path, token, body string) (int, map[string]any) {
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+
+	// 1) 生成永久验证码（随机 8 位）
+	code, out := authed("POST", "/v1/device/invite", owner.Token, `{}`)
+	if code != 200 {
+		t.Fatalf("生成验证码应 200，得到 %d %v", code, out)
+	}
+	invCode := out["code"].(string)
+	if len(invCode) != 8 {
+		t.Fatalf("验证码应为 8 位: %q", invCode)
+	}
+
+	// 2) 永久码可重复使用：同码两次 join 均 pending
+	joinBody := `{"inviteCode":"` + invCode + `","deviceName":"pc-a","machineId":"M1"}`
+	code, out = authed("POST", "/v1/device/join", "", joinBody)
+	if code != 200 || out["status"] != "pending" {
+		t.Fatalf("首次 join 应 pending: %d %v", code, out)
+	}
+	joinBody2 := `{"inviteCode":"` + invCode + `","deviceName":"pc-b","machineId":"M2"}`
+	code, out = authed("POST", "/v1/device/join", "", joinBody2)
+	if code != 200 || out["status"] != "pending" {
+		t.Fatalf("永久码二次 join 应仍可用: %d %v", code, out)
+	}
+
+	// 3) 机器码去重：开放注册同机器码复用
+	reg1 := `{"deviceName":"pc-r1","machineId":"MM-01"}`
+	code, out = authed("POST", "/v1/device/register", "", reg1)
+	if code != 200 || out["status"] != "registered" {
+		t.Fatalf("注册应成功: %d %v", code, out)
+	}
+	id1 := out["deviceId"].(string)
+	reg2 := `{"deviceName":"pc-r1-again","machineId":"MM-01"}`
+	code, out = authed("POST", "/v1/device/register", "", reg2)
+	if code != 200 || out["deviceId"] != id1 {
+		t.Fatalf("同机器码应复用同一设备: %d %v", code, out)
+	}
+
+	// 4) 变更验证码：踢出旧码加入的设备
+	// 先让 owner 引入一台设备（直接 CreateWithMachine 模拟 approve 结果）
+	peer, err := s.devices.CreateWithMachine("pc-peer", owner.ID, owner.RoomID, invCode, "MM-peer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out = authed("POST", "/v1/device/invite", owner.Token, `{"rotate":true}`)
+	if code != 200 {
+		t.Fatalf("变更验证码应 200: %d %v", code, out)
+	}
+	newCode := out["code"].(string)
+	if newCode == invCode {
+		t.Fatalf("变更后应得到新码")
+	}
+	// 旧码失效：旧码 join 应 403
+	code, _ = authed("POST", "/v1/device/join", "", `{"inviteCode":"`+invCode+`","deviceName":"x","machineId":"MM-x"}`)
+	if code != 403 {
+		t.Fatalf("旧码应已失效，得到 %d", code)
+	}
+	// 旧设备被踢出（吊销）
+	if s.devices.FindByToken(peer.Token) != nil {
+		t.Fatalf("变更验证码后旧设备应被吊销")
+	}
+}
+
+func TestDeviceRoomList(t *testing.T) {
+	_, ts := newTestServer(t)
+	defer ts.Close()
+
+	// owner 开放注册建房（带机器码）
+	code, out := rest(t, ts, "POST", "/v1/device/register", "", `{"deviceName":"owner-pc","machineId":"ROOM-1"}`)
+	if code != 200 {
+		t.Fatalf("注册失败: %d %v", code, out)
+	}
+	ownerToken := out["deviceToken"].(string)
+	ownerID := out["deviceId"].(string)
+
+	// owner 生成码，第二台设备 join（pending → approve）
+	code, out = rest(t, ts, "POST", "/v1/device/invite", ownerToken, `{}`)
+	if code != 200 {
+		t.Fatalf("生成码失败: %d %v", code, out)
+	}
+	invCode := out["code"].(string)
+	code, out = rest(t, ts, "POST", "/v1/device/join", "", `{"inviteCode":"`+invCode+`","deviceName":"joiner","machineId":"ROOM-2"}`)
+	if code != 200 || out["status"] != "pending" {
+		t.Fatalf("join 应 pending: %d %v", code, out)
+	}
+	reqID := out["requestId"].(string)
+	code, _ = rest(t, ts, "POST", "/v1/device/pending/decide", ownerToken, `{"requestId":"`+reqID+`","approve":true}`)
+	if code != 200 {
+		t.Fatalf("approve 失败")
+	}
+
+	// joiner 查 room：应看到 2 台（owner + joiner），joiner 侧无 mine
+	code, out = rest(t, ts, "GET", "/v1/device/room", ownerToken, "")
+	if code != 200 {
+		t.Fatalf("room 查询失败: %d %v", code, out)
+	}
+	room := out["room"].([]any)
+	if len(room) != 2 {
+		t.Fatalf("同步组应有 2 台设备，得到 %d: %v", len(room), out)
+	}
+	// 校验字段：owner 条目 self=true；joiner 条目 mine=true（owner 视角）
+	found := map[string]map[string]any{}
+	for _, it := range room {
+		m := it.(map[string]any)
+		found[m["deviceId"].(string)] = m
+	}
+	o, ok := found[ownerID]
+	if !ok || o["self"] != true {
+		t.Fatalf("owner 条目应 self=true: %v", o)
+	}
+	// owner 是 register 建房者（CreatedBy=register），mine=false 正确：自己不移除自己
+	if o["mine"] != false {
+		t.Fatalf("owner(register) 条目应 mine=false: %v", o)
+	}
+	// joiner 条目：owner 视角 mine=true（经由本机配对码加入）
+	for _, it := range room {
+		m := it.(map[string]any)
+		if m["deviceId"].(string) != ownerID {
+			if m["mine"] != true || m["self"] != false {
+				t.Fatalf("joiner 条目应 mine=true self=false: %v", m)
+			}
+		}
+	}
+}
+
+func rest(t *testing.T, ts *httptest.Server, method, path, token, body string) (int, map[string]any) {
+	t.Helper()
+	var req *http.Request
+	if method == "POST" {
+		req, _ = http.NewRequest(method, ts.URL+path, bytes.NewBufferString(body))
+	} else {
+		req, _ = http.NewRequest(method, ts.URL+path, nil)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	out := map[string]any{}
+	_ = json.Unmarshal(b, &out)
+	return resp.StatusCode, out
 }

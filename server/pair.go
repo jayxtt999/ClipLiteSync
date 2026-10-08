@@ -46,6 +46,8 @@ type PendingJoin struct {
 	Name      string    `json:"name"`   // 申请设备名
 	CreatedAt time.Time `json:"createdAt"`
 	Status    string    `json:"status"` // pending / approved / rejected
+	// MachineID 申请设备的硬件机器码，approve 时写入新设备用于去重
+	MachineID string `json:"machineId,omitempty"`
 	// approve 后填充，供申请方轮询领取
 	DeviceID    string `json:"deviceId,omitempty"`
 	DeviceToken string `json:"deviceToken,omitempty"`
@@ -60,7 +62,7 @@ func NewPendingStore() *PendingStore {
 	return &PendingStore{entries: map[string]*PendingJoin{}}
 }
 
-func (ps *PendingStore) Create(code, device, name string, ttl time.Duration) *PendingJoin {
+func (ps *PendingStore) Create(code, device, name, machineID string, ttl time.Duration) *PendingJoin {
 	id, _ := randomToken(16)
 	p := &PendingJoin{
 		RequestID: id,
@@ -69,6 +71,7 @@ func (ps *PendingStore) Create(code, device, name string, ttl time.Duration) *Pe
 		Name:      name,
 		CreatedAt: time.Now(),
 		Status:    "pending",
+		MachineID: machineID,
 	}
 	ps.mu.Lock()
 	ps.expireLocked()
@@ -191,7 +194,8 @@ func (s *Server) authDevice(r *http.Request) *Device {
 
 // ---------- REST：设备侧配对 ----------
 
-// POST /v1/device/invite —— 已配对设备生成配对码
+// POST /v1/device/invite —— 已配对设备生成永久验证码（8 位随机，可重复使用）。
+// 请求体可选 {"rotate":true}：变更验证码时传 true，会先撤销旧码并踢出旧码加入的全部设备。
 func (s *Server) handleDeviceInvite(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respond(w, 405, map[string]string{"error": "method not allowed"})
@@ -199,23 +203,41 @@ func (s *Server) handleDeviceInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	device := s.authDevice(r)
 	if device == nil {
-		respond(w, 401, map[string]string{"error": "设备 token 无效"})
+		respond(w, 401, map[string]string{"error": "本机配对已失效，请重新配对（在客户端点「生成配对码」或填码「加入」）"})
 		return
 	}
-	// 每设备同时最多 5 个有效码，防刷
-	active := 0
-	for _, inv := range s.invites.ListByCreator(device.ID) {
-		if !inv.Used && time.Now().Before(inv.ExpiresAt) {
-			active++
+	var req struct {
+		Rotate bool `json:"rotate"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req) // 空体或解析失败均按默认处理
+
+	if req.Rotate {
+		// 变更验证码：先踢出旧码加入的全部设备，再撤销旧码
+		for _, old := range s.invites.ListByCreator(device.ID) {
+			for _, d := range s.devices.ListByInviteCode(old.Code) {
+				if s.devices.Revoke(d.ID) {
+					kicked := s.hub.KickDevice(d.ID)
+					log.Printf("[pair] %s 变更验证码：踢出旧设备 %s(%s)，断开 %d 连接",
+						device.ID, d.Name, d.ID, kicked)
+				}
+			}
 		}
+		s.invites.RevokeByCreator(device.ID)
+		log.Printf("[pair] 设备 %s(%s) 变更验证码，已撤销全部旧码并踢出旧设备",
+			device.Name, device.ID)
 	}
-	if active >= 5 {
-		respond(w, 429, map[string]string{"error": "有效配对码已达上限（5 个），请等其过期"})
+
+	inv, err := s.invites.New(device.ID)
+	if err != nil {
+		respond(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	inv := s.invites.New(device.ID, s.cfg.InviteTTL)
-	log.Printf("[pair] 设备 %s(%s) 生成配对码 %s", device.Name, device.ID, inv.Code)
-	respond(w, 200, map[string]any{"code": inv.Code, "expiresAt": inv.ExpiresAt.UnixMilli()})
+	log.Printf("[pair] 设备 %s(%s) 生成永久验证码 %s（到期 %s）",
+		device.Name, device.ID, inv.Code, inv.ExpiresAt.Format("2006-01-02 15:04:05"))
+	respond(w, 200, map[string]any{
+		"code":      inv.Code,
+		"expiresAt": inv.ExpiresAt.UnixMilli(),
+	})
 }
 
 // POST /v1/device/join —— 新设备填码申请加入（两阶段）
@@ -223,6 +245,7 @@ func (s *Server) handleDeviceJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		InviteCode string `json:"inviteCode"`
 		DeviceName string `json:"deviceName"`
+		MachineID  string `json:"machineId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.joinGuard.Allow(r, false)
@@ -240,17 +263,22 @@ func (s *Server) handleDeviceJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if inv == nil || inv.Used || !time.Now().Before(inv.ExpiresAt) {
-		respond(w, 403, map[string]string{"error": "配对码无效或已使用"})
+		respond(w, 403, map[string]string{"error": "配对码不正确，请核对后重试（可能已被对方变更）"})
 		return
 	}
-	// 消耗配对码（一次性）
+	// 领取验证码（永久码可重复使用，不消耗）
 	if !s.invites.Take(req.InviteCode) {
-		respond(w, 403, map[string]string{"error": "配对码无效或已使用"})
+		respond(w, 403, map[string]string{"error": "配对码不正确，请核对后重试（可能已被对方变更）"})
 		return
 	}
-	// 创始码（管理员生成）：无确认人，直接建号
+	// 创始码（管理员生成）：无确认人，直接建号（去重：同机器码复用已有设备）
 	if inv.CreatedBy == "admin" {
-		d, err := s.devices.Create(req.DeviceName, "admin", "")
+		if existing := s.devices.FindByMachineID(req.MachineID); existing != nil {
+			log.Printf("[pair] 创始码加入：机器码 %s 已存在设备 %s，复用", req.MachineID, existing.ID)
+			respond(w, 200, map[string]string{"status": "approved", "deviceId": existing.ID, "deviceToken": existing.Token})
+			return
+		}
+		d, err := s.devices.CreateWithMachine(req.DeviceName, "admin", "", inv.Code, req.MachineID)
 		if err != nil {
 			respond(w, 500, map[string]string{"error": err.Error()})
 			return
@@ -263,7 +291,7 @@ func (s *Server) handleDeviceJoin(w http.ResponseWriter, r *http.Request) {
 	if len(req.DeviceName) > 64 {
 		req.DeviceName = req.DeviceName[:64]
 	}
-	p := s.pending.Create(inv.Code, inv.CreatedBy, req.DeviceName, 10*time.Minute)
+	p := s.pending.Create(inv.Code, inv.CreatedBy, req.DeviceName, req.MachineID, 10*time.Minute)
 	log.Printf("[pair] 设备 %s 申请加入 %s 的房间（待确认 %s）", req.DeviceName, inv.CreatedBy, p.RequestID[:8])
 	respond(w, 200, map[string]string{"status": "pending", "requestId": p.RequestID})
 }
@@ -301,6 +329,7 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		DeviceName string `json:"deviceName"`
+		MachineID  string `json:"machineId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.joinGuard.Allow(r, false)
@@ -323,7 +352,13 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 	if len(name) > 64 {
 		name = name[:64]
 	}
-	d, err := s.devices.Create(name, "register", "")
+	// 去重：同机器码已注册过则复用（开放注册时本机重新注册返回原身份）
+	if existing := s.devices.FindByMachineID(req.MachineID); existing != nil {
+		log.Printf("[pair] 开放注册：机器码 %s 已存在设备 %s，复用", req.MachineID, existing.ID)
+		respond(w, 200, map[string]string{"status": "registered", "deviceId": existing.ID, "deviceToken": existing.Token})
+		return
+	}
+	d, err := s.devices.CreateWithMachine(name, "register", "", "", req.MachineID)
 	if err != nil {
 		respond(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -336,7 +371,7 @@ func (s *Server) handleDeviceRegister(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDevicePending(w http.ResponseWriter, r *http.Request) {
 	device := s.authDevice(r)
 	if device == nil {
-		respond(w, 401, map[string]string{"error": "设备 token 无效"})
+		respond(w, 401, map[string]string{"error": "本机配对已失效，请重新配对（在客户端点「生成配对码」或填码「加入」）"})
 		return
 	}
 	list := s.pending.ListByDevice(device.ID)
@@ -356,7 +391,7 @@ func (s *Server) handleDevicePending(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePendingDecide(w http.ResponseWriter, r *http.Request) {
 	device := s.authDevice(r)
 	if device == nil {
-		respond(w, 401, map[string]string{"error": "设备 token 无效"})
+		respond(w, 401, map[string]string{"error": "本机配对已失效，请重新配对（在客户端点「生成配对码」或填码「加入」）"})
 		return
 	}
 	var req struct {
@@ -387,7 +422,17 @@ func (s *Server) handlePendingDecide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 记录引入关系：房主可在此后列表/踢出该设备；新设备归入房主所在房间
-	d, err := s.devices.Create(p.Name, device.ID, device.RoomID)
+	// 去重：同机器码已有设备则复用，避免重复终端
+	if existing := s.devices.FindByMachineID(p.MachineID); existing != nil {
+		p.Status = "approved"
+		p.DeviceID = existing.ID
+		p.DeviceToken = existing.Token
+		log.Printf("[pair] %s 允许 %s 加入，机器码 %s 已存在，复用设备 %s",
+			device.ID, p.Name, p.MachineID, existing.ID)
+		respond(w, 200, map[string]string{"ok": "approved", "deviceId": existing.ID})
+		return
+	}
+	d, err := s.devices.CreateWithMachine(p.Name, device.ID, device.RoomID, p.Code, p.MachineID)
 	if err != nil {
 		respond(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -395,7 +440,8 @@ func (s *Server) handlePendingDecide(w http.ResponseWriter, r *http.Request) {
 	p.Status = "approved"
 	p.DeviceID = d.ID
 	p.DeviceToken = d.Token
-	log.Printf("[pair] %s 允许 %s 加入（新设备 %s，由 %s 引入）", device.ID, p.Name, d.ID, device.ID)
+	log.Printf("[pair] %s 允许 %s 加入（新设备 %s，由 %s 引入）",
+		device.ID, p.Name, d.ID, device.ID)
 	respond(w, 200, map[string]string{"ok": "approved", "deviceId": d.ID})
 }
 
@@ -407,7 +453,7 @@ func (s *Server) handleDevicePeers(w http.ResponseWriter, r *http.Request) {
 	}
 	device := s.authDevice(r)
 	if device == nil {
-		respond(w, 401, map[string]string{"error": "设备 token 无效"})
+		respond(w, 401, map[string]string{"error": "本机配对已失效，请重新配对（在客户端点「生成配对码」或填码「加入」）"})
 		return
 	}
 	list := s.devices.ListByCreator(device.ID)
@@ -423,6 +469,39 @@ func (s *Server) handleDevicePeers(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{"peers": out})
 }
 
+// GET /v1/device/room —— 列出同步组（房间）内全部未吊销设备（含本机）。
+// self=是否本机；mine=是否经由本机配对码加入（仅这些设备允许本机移除）。
+func (s *Server) handleDeviceRoom(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respond(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	device := s.authDevice(r)
+	if device == nil {
+		respond(w, 401, map[string]string{"error": "本机配对已失效，请重新配对（在客户端点「生成配对码」或填码「加入」）"})
+		return
+	}
+	list := s.devices.ListByRoom(device.RoomID)
+	type item struct {
+		DeviceID  string `json:"deviceId"`
+		Name      string `json:"name"`
+		CreatedAt int64  `json:"createdAt"`
+		Self      bool   `json:"self"`
+		Mine      bool   `json:"mine"`
+	}
+	out := make([]item, 0, len(list))
+	for _, d := range list {
+		out = append(out, item{
+			DeviceID:  d.ID,
+			Name:      d.Name,
+			CreatedAt: d.CreatedAt,
+			Self:      d.ID == device.ID,
+			Mine:      d.CreatedBy == device.ID,
+		})
+	}
+	respond(w, 200, map[string]any{"room": out})
+}
+
 // POST /v1/device/peers/revoke —— 房主移除（踢出）自己引入的设备
 func (s *Server) handleDevicePeerRevoke(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -431,7 +510,7 @@ func (s *Server) handleDevicePeerRevoke(w http.ResponseWriter, r *http.Request) 
 	}
 	device := s.authDevice(r)
 	if device == nil {
-		respond(w, 401, map[string]string{"error": "设备 token 无效"})
+		respond(w, 401, map[string]string{"error": "本机配对已失效，请重新配对（在客户端点「生成配对码」或填码「加入」）"})
 		return
 	}
 	var req struct {

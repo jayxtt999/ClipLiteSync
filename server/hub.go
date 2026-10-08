@@ -239,7 +239,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	device := s.devices.FindByToken(hello.Token)
 	if device == nil {
-		writeDirect(ws, map[string]any{"v": 1, "type": "error", "code": "bad_token", "detail": "token 无效或已吊销"})
+		writeDirect(ws, map[string]any{"v": 1, "type": "error", "code": "bad_token", "detail": "配对已失效，请重新配对"})
 		return
 	}
 	ws.SetReadDeadline(time.Time{}) // 清除握手超时，此后按每条消息 120s
@@ -326,7 +326,11 @@ func (s *Server) handleAdminInvite(w http.ResponseWriter, r *http.Request) {
 		respond(w, 401, map[string]string{"error": "未授权"})
 		return
 	}
-	inv := s.invites.New("admin", s.cfg.InviteTTL)
+	inv, err := s.invites.New("admin")
+	if err != nil {
+		respond(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
 	log.Printf("[pair] 管理员生成创始码 %s", inv.Code)
 	respond(w, 200, map[string]string{"inviteCode": inv.Code})
 }

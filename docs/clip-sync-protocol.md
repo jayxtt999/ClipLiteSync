@@ -17,7 +17,7 @@
 | --- | --- |
 | 传输 | WebSocket（`/ws`）；局域网可 `ws://`，公网必须经 TLS 反代为 `wss://` |
 | 鉴权 | WS 握手时带 `Authorization: Bearer <device_token>`，或连接后首帧 `hello` 内带 token |
-| token | 服务端建组时生成管理员 token；新设备凭**一次性邀请码**（6 位、10 分钟有效）`POST /v1/device/join` 换取长期 device_token；服务端可吊销 |
+| token | 服务端建组时生成管理员 token；新设备凭**永久配对码**（8 位大写字母+数字）`POST /v1/device/join` 换取长期 device_token（经房主确认后发放）；服务端可吊销 |
 | 上限 | 单条消息 ≤ 64MB（服务端可配）；缓冲 ≤ 200 条且 ≤ 256MB（可配，超限淘汰最旧） |
 
 ## 3. 帧格式（JSON，UTF-8）
@@ -93,19 +93,19 @@
 
 ## 5. REST 接口（管理面，非数据面）
 
-配对模型（v0.3，房间制）：已配对设备可生成**一次性配对码**（8 位大写字母+数字，去掉易混淆的 0/1/I/O，10 分钟有效）；新设备填码提交**加入申请**（不直接发 token），由生成码的设备**确认后才发 token**。管理员生成的"创始码"用于引导首台设备（无确认人，直接放行）。
+配对模型（v0.3，房间制）：已配对设备可生成**永久配对码**（8 位大写字母+数字，去掉易混淆的 0/1/I/O）；新设备填码提交**加入申请**（不直接发 token），由生成码的设备**确认后才发 token**。管理员生成的"创始码"用于引导首台设备（无确认人，直接放行）。
 
 | 方法/路径 | 说明 |
 | --- | --- |
 | `POST /v1/admin/login` | 管理员密码 → admin token（未设置 `CLIPSYNC_ADMIN_PASSWORD` 时返回 403，管理面不可用） |
-| `POST /v1/admin/invite` | 生成一次性创始码（管理员，引导首台设备） |
-| `POST /v1/device/invite` | 已配对设备生成配对码 → `{code, expiresAt}`（每设备同时最多 5 个有效码） |
-| `POST /v1/device/join` | `{inviteCode, deviceName}`；创始码 → `{status:"approved", deviceId, deviceToken}`；设备码 → `{status:"pending", requestId}` |
+| `POST /v1/admin/invite` | 生成永久创始码（管理员，引导首台设备） |
+| `POST /v1/device/invite` | 已配对设备生成永久配对码 → `{code, expiresAt}`（每设备同时最多 5 个有效码） |
+| `POST /v1/device/join` | `{inviteCode, deviceName, machineId}`；创始码 → `{status:"approved", deviceId, deviceToken}`；设备码 → `{status:"pending", requestId}` |
 | `GET  /v1/device/join/status?requestId=` | 申请方轮询 → `{status: pending\|approved(+token)\|rejected\|expired\|not_found}` |
 | `GET  /v1/device/pending` | 房主拉取自己码的待确认申请 |
 | `POST /v1/device/pending/decide` | 房主 `{requestId, approve}` 允许/拒绝 |
 | `GET  /v1/admin/devices` | 设备列表 |
-| `DELETE /v1/admin/devices/{id}` | 吊销设备（吊销后 token 立即失效） |
+| `POST /v1/admin/devices/{id}` | 吊销设备（吊销后 token 立即失效） |
 | `GET  /healthz` | 存活检查 |
 
 **防暴力遍历**（`/v1/device/join`，按 IP）：每分钟最多 5 次；连续失败 10 次锁定 15 分钟；成功清零计数。

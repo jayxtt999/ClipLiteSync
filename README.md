@@ -1,140 +1,140 @@
-# ClipLite
+# ClipLiteSync
 
-ClipLite 是一款仅支持 Windows 的原生剪贴板历史工具。它使用 C++17、Win32 API 和 GDI/GDI+ 构建，不依赖 WebView、Electron、WinUI、Qt 或其他大型运行时，重点是低常驻内存、可靠保存剪贴板格式和便携发布。
+> **ClipLiteSync** 是一款**多设备剪贴板同步**工具，同时保留了一个轻量、省内存的 Windows 剪贴板历史管理器。它把「电脑上复制、手机上粘贴」与「手机上复制、电脑上粘贴」变成日常工作流。
+>
+> 本项目 **fork 自 [wxh-777/ClipLite](https://github.com/wxh-777/ClipLite)**（一款仅支持 Windows 的原生剪贴板历史工具）。在原项目基础上扩展了多设备剪贴板同步能力，新增了 Go 同步服务端与 Android 客户端；原项目的剪贴板历史功能得以完整保留。
 
-当前正式版本：**1.4.0**（x64）
+[English](README.en.md) · [使用说明](USAGE.md) · [同步操作指南](docs/sync-user-guide.md) · [同步协议](docs/clip-sync-protocol.md) · [更新日志](CHANGELOG.md)
 
-完整中文使用说明：[USAGE.md](USAGE.md)
-英文文档：[README.en.md](README.en.md)
+当前版本：**2.0.1**
 
-## 项目初衷
+---
 
-AI 应用快速发展后，存储成本持续上升，内存和设备资源也越来越宝贵。很多桌面工具只是放在后台，也会长期占用一大块空间和内存。
+## 架构总览
 
-ClipLite 从一开始就希望把剪贴板历史做得更克制：程序尽量小，后台尽量省内存，历史内容需要时再读取。省下来的每一点资源，都可以留给真正重要的应用和工作内容。
+ClipLiteSync 由三部分组成：
 
-## 功能
+```
+┌───────────────┐   WebSocket / REST    ┌──────────────────┐
+│ Windows 客户端 │ ───────────────────▶ │   Go 同步服务端    │
+│ (C++ / Win32)  │                      │ (单二进制, :8765) │
+└───────────────┘                      └────────┬─────────┘
+        ▲                                        │
+        │            WebSocket / REST             │
+┌───────┴────────┐                              │
+│ Android 客户端  │ ◀────────────────────────────┘
+│ (Kotlin/Compose)│
+└────────────────┘
+```
+
+| 端 | 技术栈 | 目录 | 产物 |
+|---|---|---|---|
+| 同步服务端 | Go（单二进制，无数据库） | `server/` | `clipsync-server.exe` |
+| Windows 客户端 | C++17 / Win32 / GDI+ | `src/` `include/` `resources/` | `ClipLite.exe` |
+| Android 客户端 | Kotlin / Jetpack Compose | `mobile-android/` | `clipsync.apk` |
+
+多台设备（Windows / Android 任意组合）连接到同一台服务端、加入同一「同步房间」后，剪贴板内容即自动互相同步。支持多房间隔离：不同房间的设备互不相通。
+
+## 截图
+
+| Windows 客户端 | |
+|---|---|
+| ![Windows 剪贴板历史](docs/screenshots/win-history.png) | ![Windows 同步设置](docs/screenshots/win-settings-sync.png) |
+
+| Android 客户端 | | |
+|---|---|---|
+| ![Android 历史页](docs/screenshots/android-history.png) | ![Android 设备页](docs/screenshots/android-devices.png) | ![Android 设置页](docs/screenshots/android-settings.png) |
+
+---
+
+## 功能特性
+
+### 多设备剪贴板同步（本项目的核心能力）
+
+- **跨平台双向同步**：文本、图片在 Windows 与 Android 之间实时同步。
+- **房间制配对**：设备填服务器地址后「一键建房」成为房主；其他设备填 8 位永久配对码申请加入，房主确认后即入组。
+- **永久配对码**：8 位大写字母+数字（去掉了易混淆的 0/1/I/O），长期有效、可重复使用。
+- **自动重连与补发**：断网自动指数退避重连；重连后按 `last_seq` 补发离线期间缺失的事件。
+- **多房间隔离**：同一服务端可承载多个互不相通的同步组。
+- **设备管理**：房主可查看、移除自己引入的设备；变更验证码会撤销旧码并踢出旧设备。
+- **防回环**：远端注入的内容不会再次上行，杜绝 A→B→A 循环。
+- **去重**：`syncId` 幂等 + 内容 `hash` 查重，避免重复入库。
+- **安全限制**：加入接口按 IP 限速（每分钟 5 次）、连续失败锁定（10 次锁 15 分钟）。
+
+### 剪贴板历史（继承自 ClipLite）
 
 - 使用 `Alt+V` 打开历史窗口，可选替换 Windows 的 `Win+V`。
-- 捕获并恢复纯文本、HTML、文件列表、DIB 和 DIBV5 图片；文件列表中的图片文件按需显示缩略图。
-- 支持搜索、按类型筛选，以及按时间范围、内容长度、来源应用多选和排序方式组合筛选；支持置顶、删除、清空和自动粘贴。
-- 支持独立图片及内容预览浮窗；自动预览悬停后可直接滚轮缩放、拖拽图片，浮窗显示当前原图倍率及按需加载原图的状态。也可选择按键预览（默认 `F2`）或关闭预览；长文本支持滚轮滚动。
-- 自动预览默认为开启；已明确关闭自动预览的旧配置会继续保持关闭。
-- 搜索默认点击后直接获得输入焦点；可在设置中开启兼容模式，保留原应用前台并使用 `Ctrl+Space` 进入中文输入法。
-- “打开历史窗口后直接搜索”默认关闭；开启后打开历史窗口会直接把键盘输入交给搜索框，也可在历史窗口右键菜单中切换。
-- 设置页内容较长时显示右侧滚动条，支持滚轮、轨道分页和鼠标拖动滑块。
-- 支持纯文本粘贴和富文本粘贴，图片按需读取并使用受限的内存与磁盘缩略图缓存；文件记录中的路径失效时会在列表标记并在粘贴前提示。
-- 支持浅色、深色、护眼绿、护眼夜间、纸张暖色和午夜蓝主题；可固定主题，或分别指定跟随 Windows 亮色/暗色时使用的主题。外观设置页支持创建、编辑和删除自定义主题，并调整 14 项实际用于界面的配色。
-- 支持英文和简体中文界面。
-- 程序运行在系统托盘中；Explorer 重启或任务栏刷新后会自动恢复托盘图标。
-- 支持最大记录数、磁盘空间、保留天数、单条内容大小和暂停监听设置。
-- 置顶记录不会被条数、容量、过期或启动恢复清理自动删除，也不会被新的剪贴板内容覆盖。
-- 支持按来源应用忽略内容、敏感文本自动过期和 Windows DPAPI 用户级加密。
-- 支持普通安装模式和便携模式；剪贴板归档、历史内容读取和使用统计通过短任务工作线程处理，不在内存中保存完整历史正文。
-- 关于页支持一键打开 GitHub 源码和检查最新版本；程序启动后会在后台自动检查一次更新，不阻塞剪贴板功能。
-- 更新检查支持配置代理前缀，例如 `https://gh-proxy.com`，程序会把 GitHub API 和安装包地址拼接为 `https://gh-proxy.com/https://github.com/...`；留空则直连 GitHub。
-- 便携版会自动匹配并打开 `ClipLite-*-portable-win-x64.zip`，安装版则匹配 `ClipLite-Setup-*.exe`；更新便携版时请保留原目录中的 `data\\` 目录。
-- 开启“以管理员权限运行”时首次需要确认一次 Windows 授权；之后通过当前用户的最高权限计划任务启动，正常启动不再重复弹出授权窗口。关闭该选项会移除计划任务。
-- 管理员权限运行时，在 Windows 允许的范围内可提高与部分高权限窗口之间的剪贴板访问和粘贴兼容性；ClipLite 仍无法绕过 UIPI、安全桌面或受保护窗口限制。
+- 捕获并恢复纯文本、HTML、文件列表、图片（DIB/DIBV5），文件列表中的图片按需显示缩略图。
+- 支持搜索、按类型/时间/长度/来源应用筛选，置顶、删除、清空、自动粘贴。
+- 图片与长文本独立预览浮窗，支持滚轮缩放、拖拽查看。
+- 六种主题（浅色/深色/护眼绿/护眼夜间/纸张暖色/午夜蓝）+ 自定义主题编辑器。
+- 浅色/深色、中英双语界面，常驻系统托盘，低内存占用（闲时约 0.7 MB）。
+- 支持最大记录数/磁盘空间/保留天数/单条大小限制，置顶记录不自动清理。
+- 支持按来源应用忽略、敏感文本自动过期、Windows DPAPI 用户级加密。
+- 普通安装模式与便携模式。
 
-## 界面预览
+---
 
-历史窗口（含图片记录）：
+## 快速开始
 
-![ClipLite 历史窗口](https://raw.githubusercontent.com/wxh-777/ClipLite/main/docs/screenshots/history.png)
+### 1. 部署服务端
 
-设置窗口：
+在一台常开的机器（Windows / NAS / Linux VPS 均可）上运行服务端：
 
-![ClipLite 设置窗口](https://raw.githubusercontent.com/wxh-777/ClipLite/main/docs/screenshots/settings.png)
+```pwsh
+# Windows
+$env:CLIPSYNC_ADMIN_PASSWORD = "<你的管理密码>"
+$env:CLIPSYNC_DATA_DIR = "./data"
+.\clipsync-server.exe
+```
 
-任务管理器闲时内存实测：
+```bash
+# Linux（交叉编译：GOOS=linux go build）
+CLIPSYNC_ADMIN_PASSWORD="<你的管理密码>" ./clipsync-server
+```
 
-![ClipLite 任务管理器内存占用](https://raw.githubusercontent.com/wxh-777/ClipLite/main/docs/screenshots/task-manager-memory.png)
+服务端默认监听 `:8765`。详细的环境变量说明见 [server/README.md](server/README.md)。
 
-## 性能与体积
+### 2. 接入客户端
 
-ClipLite 专注于“常驻但不打扰”：相比常见剪贴板工具，占用更少内存，适合长期在后台运行，也不需要额外运行时。
+在每台设备的「设置 → 同步」页（Windows）或「配对向导」（Android）：
 
-剪贴板格式捕获、历史归档和历史粘贴前的内容读取在后台执行。部分应用复制后需要延迟提供 HTML、文本或图片格式时，不会因为磁盘写入或解密阻塞 ClipLite 的历史窗口、粘贴和全局快捷键响应。
+1. 填「服务器地址」，如 `ws://192.168.1.10:8765`（局域网）或 `wss://your.domain`（公网，需 TLS 反代）。
+2. **第一台设备**：直接点「生成配对码」→ 自动在服务端注册并创建一个新房间。
+3. **其他设备**：填第一台设备生成的 8 位配对码 → 点「加入」→ 房主在「待确认」里接受。
 
-- 任务管理器闲时显示的内存约为 `0.7 MB`（截图实测）。
-- 使用测量工具采样时，本机 Release 的 Private Bytes 约为 `2.5 MB`；这是另一种统计口径。
-- 主程序体积小于 `1 MB`。
-- 启动约 `0.05 秒`，打开历史窗口后才按需读取内容和图片。
-- 历史窗口缓存最近显示的图片缩略图，连续滚动不会重复读取和解码同一原图。
+完整操作指引（含多分组、移除设备、常见问题）见 [docs/sync-user-guide.md](docs/sync-user-guide.md)，配对与连接流程原理见 [docs/pairing-flow.md](docs/pairing-flow.md)。
 
-这意味着它适合长期后台运行，也适合放在 U 盘或便携目录中使用。
+> **公网部署提示**：公网请使用 `wss://`（推荐 Caddy/Nginx 做 TLS 反代），不要直接暴露明文 `ws://`。开放注册默认开启，公网部署建议设 `CLIPSYNC_DISABLE_REGISTER=1` 关闭，改用管理员创始码引导首台设备。
 
-<details>
-<summary>查看详细测量条件</summary>
+---
 
-当前 Windows x64 Release 本机实测：任务管理器闲时显示内存约 `0.7 MB`、Working Set `13.73 MB`、Private Bytes `2.50 MB`、主程序体积小于 `1 MB`、启动耗时 `53.03 ms`、GDI `13`、USER `10`。任务管理器、Working Set 和 Private Bytes 的统计口径不同，因此显示数值可能不同；截图中的 `0.7 MB` 是任务管理器闲时观察值。
+## 下载
 
-数据由 `tools/measure.ps1` 在程序启动约 1 秒后、未打开历史窗口的空闲状态采样。实际数值会受到 Windows 版本、DPI、系统状态、历史数据和运行场景影响，这些数据是本机 Release 参考值，不是所有设备上的固定承诺。
+Releases 提供以下产物（见 [Releases 页面](https://github.com/jayxtt999/ClipLiteSync/releases)）：
 
-</details>
+- `ClipLite.exe` — Windows 客户端（x64）
+- `clipsync-server.exe` — 同步服务端（Windows x64）
+- `clipsync.apk` — Android 客户端
 
-## 为什么选择 ClipLite
+> Android 端当前为**调试签名包**（未上架商店），安装时需允许「未知来源」。下载后直接安装即可使用。
 
-ClipLite 更适合希望“复制过的内容方便找回，但程序不要拖慢电脑”的用户。
-
-| 对比项目 | ClipLite | 常见剪贴板工具 |
-| --- | --- | --- |
-| 后台占用 | 任务管理器闲时显示约 `0.7 MB`；Private Bytes 约 `2.5 MB` | 功能越多，常驻占用通常越高 |
-| 程序体积 | 主程序小于 `1 MB` | 依赖运行时或集成功能后通常更大 |
-| 运行方式 | 原生 Win32，无 WebView 和大型运行时 | 部分工具依赖额外运行时或框架 |
-| 数据控制 | 历史默认保存在本机，可选 DPAPI 加密 | 数据位置和隐私策略因工具而异 |
-| 使用方式 | 支持安装版和便携版，可放在 U 盘 | 通常以安装版为主 |
-| 内容支持 | 文本、HTML、图片、文件列表均可保存和恢复 | 格式支持范围因工具而异 |
-| 资源读取 | 图片和完整内容按需读取，不一次性加载全部历史 | 大量历史内容可能带来更高读取和内存压力 |
-| 软件定位 | 源码可查看，非商业授权，专注剪贴板历史 | 商业软件或功能更复杂的综合工具较多 |
-
-不同工具的功能和版本差异较大，上表用于说明产品定位，不是统一环境下的跑分排名。
-
-## 下载和运行
-
-正式发布包含两种 Windows x64 形式：
-
-- 安装包：`ClipLite-Setup-1.4.0-x64.exe`。安装向导支持 English 和简体中文，会按 Windows 界面语言自动选择；同时支持自定义安装目录、开始菜单/桌面快捷方式和标准卸载。
-- 便携包：`ClipLite-1.4.0-portable-win-x64.zip`。解压后复制整个目录即可使用，数据保存在其中的 `data\\` 目录。
-
-便携包中的 `SHA256SUM.txt` 用于校验 `ClipLite.exe`。首次运行前请确认下载来源和文件校验值。
-
-## 快捷键
-
-- `Alt+V`：打开剪贴板历史。
-- `Enter` 或鼠标单击：粘贴当前项目。
-- `Ctrl+Shift+V`：粘贴为纯文本。
-- `Ctrl+Shift+R`：粘贴为富文本（仅富文本记录可用）。
-- `Delete`：删除当前项目。
-- `Esc`：关闭历史窗口。
-- `F10`：打开设置。
-- `Ctrl+0`：清除历史筛选。
-- `F2`：启用按键预览时，按住显示当前历史项目的原图或内容预览。
-
-设置页可以修改历史、设置和暂停监听快捷键。注册状态会显示当前是否存在 ClipLite 内部冲突；重复组合键会被拒绝写入。系统级快捷键如果被 Windows 或其他软件占用，会显示具体项目；默认组合键可用时自动恢复，否则会提示更换快捷键。`Win+V` 替换还受 Windows 和权限级别影响；启用时不能将“打开剪贴板历史”同时设置为 `Win+V`。
-设置项说明会根据内容自动保留多行显示空间。
-
-在设置页的常规设置区域，可以开启“粘贴后移到首位”。开启后，历史项目会按最近使用活动排序；关闭时按最近复制时间排序。程序还会保存每条记录的稳定 ID、首次录入时间、毫秒级最近复制时间、最后使用时间、复制次数、使用次数和逻辑内容长度，为排序及筛选提供数据基础。
-
-## 数据和隐私
-
-普通安装模式默认使用以下目录：
-
-- 历史：`%LOCALAPPDATA%\\ClipLite\\history.bin`
-- 设置：`%LOCALAPPDATA%\\ClipLite\\settings.ini`
-- 诊断日志：`%LOCALAPPDATA%\\ClipLite\\cliplite.log`
-
-便携模式使用便携包内的 `data\\` 目录；自定义缓存目录可以在设置页中修改。ClipLite 不把剪贴板正文写入诊断日志，也不会把用户数据写入源码仓库。
-卸载安装版时会先正常移除程序文件和快捷方式，完成后默认保留全部用户数据；如需完全删除，可在卸载完成后确认删除。该操作会清理默认或自定义数据目录中的 ClipLite 文件以及设置和日志。
-
-DPAPI 加密默认关闭。启用后，历史正文只能由同一 Windows 用户恢复。清空历史会删除本地历史文件；暂停监听可以临时避免保存新的内容。敏感内容过期默认关闭，只对包含明确敏感标记的文本进行检测。
-
-ClipLite 无法绕过 Windows UIPI。向管理员权限或受保护窗口自动粘贴可能失败；UAC 安全桌面、登录界面和其他桌面会话不属于支持范围。
+---
 
 ## 构建
 
-要求 Windows、Visual Studio 2019 或更高版本，以及 CMake 3.15 或更高版本。构建目标固定为 x64。
+### 同步服务端（Go）
+
+```bash
+cd server
+go build -o clipsync-server.exe .
+```
+
+要求 Go 1.20+。国内拉依赖可设 `GOPROXY=https://goproxy.cn,direct`。
+
+### Windows 客户端（C++ / Win32）
+
+要求 Windows、Visual Studio 2019+（含 MSVC 与 Windows SDK）、CMake 3.15+，目标 x64：
 
 ```pwsh
 cmake -S . -B build-x64 -A x64 -DBUILD_TESTING=ON
@@ -142,28 +142,63 @@ cmake --build build-x64 --config Release
 ctest --test-dir build-x64 -C Release --output-on-failure
 ```
 
-生成便携包和可选安装包：
+### Android 客户端（Kotlin / Compose）
 
-```pwsh
-powershell -ExecutionPolicy Bypass -File packaging/package.ps1
+要求 JDK 17+、Gradle 8.9+（本仓库未内置 Gradle Wrapper，请使用本机 Gradle）：
+
+```bash
+cd mobile-android
+gradle :app:assembleDebug
 ```
 
-输出位于 `build-x64\\Release\\` 和 `out\\`。开发和测试细节见 [CONTRIBUTING.md](CONTRIBUTING.md)，版本变更见 [CHANGELOG.md](CHANGELOG.md) 和 [CHANGELOG.en.md](CHANGELOG.en.md)。
+产物输出为 `app/build/outputs/apk/debug/clipsync.apk`。最低支持 Android 8.0（API 26）。
 
-## 命令行参数
+---
 
-- `ClipLite.exe --history`：启动并打开历史窗口。
-- `ClipLite.exe --settings`：启动并打开设置窗口。
-- `ClipLite.exe --exit`：请求已运行实例退出。
+## 快捷键（Windows 端）
+
+- `Alt+V`：打开剪贴板历史
+- `Enter` / 鼠标单击：粘贴当前项目
+- `Ctrl+Shift+V`：粘贴为纯文本
+- `Ctrl+Shift+R`：粘贴为富文本
+- `Delete`：删除当前项目
+- `Esc`：关闭历史窗口
+- `F10`：打开设置
+
+## 命令行参数（Windows 端）
+
+- `ClipLite.exe --history`：启动并打开历史窗口
+- `ClipLite.exe --settings`：启动并打开设置窗口
+- `ClipLite.exe --exit`：请求已运行实例退出
+
+---
+
+## 文档
+
+| 文档 | 说明 |
+|---|---|
+| [USAGE.md](USAGE.md) | Windows 端剪贴板历史使用说明（简单易懂版） |
+| [docs/sync-user-guide.md](docs/sync-user-guide.md) | 多设备同步操作指南 |
+| [docs/pairing-flow.md](docs/pairing-flow.md) | 配对与连接流程说明 |
+| [docs/clip-sync-protocol.md](docs/clip-sync-protocol.md) | 同步协议与接口定义 |
+| [docs/mobile-requirements.md](docs/mobile-requirements.md) | 移动端需求书 |
+| [docs/mobile-dev-guide.md](docs/mobile-dev-guide.md) | Android 技术方案 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |
+| [CHANGELOG.md](CHANGELOG.md) | 更新日志 |
+
+---
+
+## 数据和隐私
+
+- Windows 端历史默认存于 `%LOCALAPPDATA%\ClipLite\`，支持 DPAPI 加密、敏感内容过期、便携模式。
+- Android 端剪贴板历史仅存本机，token 使用 Android Keystore 加密存储。
+- 同步服务端默认**明文传输**（局域网自用可接受）；公网请务必使用 `wss://`。应用层不加密内容，服务端可见明文。
+- 服务端设备数据存于 `CLIPSYNC_DATA_DIR`（默认 `./data`）下的 JSON 文件，无数据库依赖。
 
 ## 许可证
 
-ClipLite 使用 [PolyForm Noncommercial License 1.0.0](LICENSE.md) 授权。该授权允许个人、教育、研究和其他非商业用途使用、学习、修改和分发源码或程序，但禁止销售、收费分发、商业集成和其他商业用途。
-
-这是一份 source-available（公开源码）许可证，不是 OSI 认可的“开源许可证”。如果需要商业使用或商业分发，请先与版权所有者取得书面商业授权。第三方依赖和资源可能有独立许可证或权利声明，使用时应分别遵守。
+ClipLiteSync 沿用上游 [wxh-777/ClipLite](https://github.com/wxh-777/ClipLite) 的许可证：[PolyForm Noncommercial License 1.0.0](LICENSE.md)。允许个人、教育、研究和其他非商业用途使用、学习、修改和分发，但禁止商业用途与商业分发。需要商业使用请先取得版权所有者书面授权。
 
 ## 反馈和安全问题
 
-普通问题请提交 Issue，并附上 Windows 版本、ClipLite 版本、复现步骤和相关日志片段。日志可能包含路径或进程名称，请在公开前检查并删除敏感信息。
-
-安全漏洞不要公开发布利用细节，请先阅读 [SECURITY.md](SECURITY.md)；英文安全说明见 [SECURITY.en.md](SECURITY.en.md)。
+普通问题请提交 [Issue](https://github.com/jayxtt999/ClipLiteSync/issues)。安全漏洞请先阅读 [SECURITY.md](SECURITY.md)，不要公开发布利用细节。

@@ -20,3 +20,30 @@ settings.ini
 # Internal project guidance; keep these out of public source releases
 AGENTS.md
 PLAN.md
+
+# ===== 服务端（Go）=====
+server/clipsync-server.exe
+server/clipsync-server.exe~
+server/data/
+server/tokenB.txt
+server/server.log
+
+# ===== 密钥/令牌（任何位置，绝不上传）=====
+tokenB.txt
+*tokenB*.txt
+
+# ===== Android =====
+mobile-android/.gradle/
+mobile-android/.kotlin/
+mobile-android/**/build/
+mobile-android/local.properties
+mobile-android/.idea/
+*.apk
+
+# ===== 通用编译垃圾 =====
+*.obj
+*.bmp
+
+# ===== 发布产物备份 =====
+resources/backup-*/
+

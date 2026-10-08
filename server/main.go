@@ -78,6 +78,12 @@ type Device struct {
 	CreatedBy string `json:"createdBy,omitempty"`
 	// RoomID 房间标识 = 房间根设备（首台设备）的 ID。同一房间的设备才能收到彼此的同步事件。
 	RoomID string `json:"roomId,omitempty"`
+	// InviteCode 记录本设备是通过哪个验证码加入的（用于变更验证码时踢出旧设备）。
+	// "register"/"admin" 来源无码，留空。
+	InviteCode string `json:"inviteCode,omitempty"`
+	// MachineID 硬件机器码（主板序列号/机器GUID等），用于设备去重：
+	// 同一机器重连/重装后复用已有设备记录，避免列表出现重复终端。
+	MachineID string `json:"machineId,omitempty"`
 }
 
 // NormalizeRooms 迁移：为没有 RoomID 的设备按 CreatedBy 树计算房间归属。
@@ -157,6 +163,16 @@ func (ds *DeviceStore) saveLocked() error {
 // Create 创建设备。rootID 传入其所在房间的根设备 ID；传空时按 createdBy 推导：
 // admin 创始码引导的设备同属房间 "admin"，register 注册的设备自成一个新房间，其余自成房间。
 func (ds *DeviceStore) Create(name, createdBy, rootID string) (*Device, error) {
+	return ds.create(name, createdBy, rootID, "", "")
+}
+
+// CreateWithMachine 创建设备并记录其引入验证码与硬件机器码。
+// 用于通过验证码加入的设备，便于「变更验证码踢出旧设备」「机器码去重」。
+func (ds *DeviceStore) CreateWithMachine(name, createdBy, rootID, inviteCode, machineID string) (*Device, error) {
+	return ds.create(name, createdBy, rootID, inviteCode, machineID)
+}
+
+func (ds *DeviceStore) create(name, createdBy, rootID, inviteCode, machineID string) (*Device, error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	id, _ := randomToken(8)
@@ -169,7 +185,7 @@ func (ds *DeviceStore) Create(name, createdBy, rootID string) (*Device, error) {
 		}
 	}
 	d := &Device{ID: "dev-" + id, Name: name, Token: tok, CreatedAt: time.Now().UnixMilli(),
-		CreatedBy: createdBy, RoomID: rootID}
+		CreatedBy: createdBy, RoomID: rootID, InviteCode: inviteCode, MachineID: machineID}
 	ds.Devices = append(ds.Devices, d)
 	return d, ds.saveLocked()
 }
@@ -193,6 +209,23 @@ func (ds *DeviceStore) ListByCreator(creatorID string) []*Device {
 	var out []*Device
 	for _, d := range ds.Devices {
 		if d.CreatedBy == creatorID && !d.Revoked {
+			out = append(out, d)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
+	return out
+}
+
+// ListByRoom 返回某同步组（房间）内全部未吊销设备（含本机），供成员列表展示。
+func (ds *DeviceStore) ListByRoom(roomID string) []*Device {
+	if roomID == "" {
+		return nil
+	}
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	var out []*Device
+	for _, d := range ds.Devices {
+		if d.RoomID == roomID && !d.Revoked {
 			out = append(out, d)
 		}
 	}
@@ -245,6 +278,34 @@ func (ds *DeviceStore) Revoke(id string) bool {
 	return false
 }
 
+// ListByInviteCode 返回通过某验证码加入、且尚未吊销的设备（用于变更验证码时踢出旧设备）。
+func (ds *DeviceStore) ListByInviteCode(code string) []*Device {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	var out []*Device
+	for _, d := range ds.Devices {
+		if d.InviteCode == code && !d.Revoked {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// FindByMachineID 按机器码查找未吊销设备（设备去重：同机器重连复用已有记录）。
+func (ds *DeviceStore) FindByMachineID(machineID string) *Device {
+	if machineID == "" {
+		return nil
+	}
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	for _, d := range ds.Devices {
+		if d.MachineID == machineID && !d.Revoked {
+			return d
+		}
+	}
+	return nil
+}
+
 func randomToken(nBytes int) (string, error) {
 	b := make([]byte, nBytes)
 	if _, err := rand.Read(b); err != nil {
@@ -253,7 +314,10 @@ func randomToken(nBytes int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// ---------- 邀请码 ----------
+// ---------- 邀请码（永久验证码） ----------
+
+// permanentTTL 永久验证码的到期时长：99 年，服务端/客户端统一按"几乎永久"处理。
+const permanentTTL = 99 * 365 * 24 * time.Hour
 
 type Invite struct {
 	Code      string    `json:"code"`
@@ -271,8 +335,9 @@ func NewInviteStore() *InviteStore {
 	return &InviteStore{invites: map[string]*Invite{}}
 }
 
-// New 生成 8 位一次性配对码（大写字母+数字，去掉易混淆的 0/1/I/O）
-func (is *InviteStore) New(createdBy string, ttl time.Duration) *Invite {
+// New 生成 8 位随机永久验证码（大写字母+数字，去掉易混淆的 0/1/I/O）。
+// 到期给 99 年（视为永久），可重复使用。
+func (is *InviteStore) New(createdBy string) (*Invite, error) {
 	is.mu.Lock()
 	defer is.mu.Unlock()
 	is.cleanupLocked()
@@ -283,9 +348,21 @@ func (is *InviteStore) New(createdBy string, ttl time.Duration) *Invite {
 			break
 		}
 	}
-	inv := &Invite{Code: code, ExpiresAt: time.Now().Add(ttl), CreatedBy: createdBy}
+	inv := &Invite{Code: code, ExpiresAt: time.Now().Add(permanentTTL), CreatedBy: createdBy}
 	is.invites[code] = inv
-	return inv
+	return inv, nil
+}
+
+// Revoke 使某设备生成的全部验证码失效（变更验证码时调用）。
+func (is *InviteStore) RevokeByCreator(createdBy string) {
+	is.mu.Lock()
+	defer is.mu.Unlock()
+	for _, inv := range is.invites {
+		if inv.CreatedBy == createdBy {
+			inv.Used = true
+			inv.ExpiresAt = time.Now().Add(-time.Second)
+		}
+	}
 }
 
 // Peek 只读查看（join 限速判定用，不消耗）
@@ -295,7 +372,7 @@ func (is *InviteStore) Peek(code string) *Invite {
 	return is.invites[code]
 }
 
-// Take 消耗一次性码（成功返回 true）
+// Take 领取验证码（成功返回 true）。永久码可重复使用，不消耗。
 func (is *InviteStore) Take(code string) bool {
 	is.mu.Lock()
 	defer is.mu.Unlock()
@@ -303,7 +380,6 @@ func (is *InviteStore) Take(code string) bool {
 	if !ok || inv.Used || time.Now().After(inv.ExpiresAt) {
 		return false
 	}
-	inv.Used = true
 	return true
 }
 
@@ -323,7 +399,7 @@ func (is *InviteStore) ListByCreator(createdBy string) []*Invite {
 func (is *InviteStore) cleanupLocked() {
 	now := time.Now()
 	for code, inv := range is.invites {
-		// 已用/已过期 1 小时后清理
+		// 已失效/已过期 1 小时后清理
 		if inv.Used || now.After(inv.ExpiresAt.Add(time.Hour)) {
 			delete(is.invites, code)
 		}
@@ -383,6 +459,7 @@ func main() {
 	mux.HandleFunc("/v1/device/pending", srv.handleDevicePending)
 	mux.HandleFunc("/v1/device/pending/decide", srv.handlePendingDecide)
 	mux.HandleFunc("/v1/device/peers", srv.handleDevicePeers)
+	mux.HandleFunc("/v1/device/room", srv.handleDeviceRoom)
 	mux.HandleFunc("/v1/device/peers/revoke", srv.handleDevicePeerRevoke)
 	mux.HandleFunc("/ws", srv.handleWS)
 

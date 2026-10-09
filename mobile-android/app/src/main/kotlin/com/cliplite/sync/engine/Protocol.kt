@@ -105,7 +105,7 @@ object Protocol {
 
     sealed class ServerFrame {
         data class HelloOk(val seq: Long, val replayed: Int) : ServerFrame()
-        data class Event(val seq: Long, val byDevice: String, val event: JsonObject) : ServerFrame()
+        data class Event(val seq: Long, val byDevice: String, val byDeviceName: String, val event: JsonObject) : ServerFrame()
         data class PublishOk(val clientEventId: String, val seq: Long) : ServerFrame()
         data class Error(val code: String, val detail: String) : ServerFrame()
         object Pong : ServerFrame()
@@ -127,6 +127,7 @@ object Protocol {
             "event" -> ServerFrame.Event(
                 seq = seq(),
                 byDevice = obj["byDevice"]?.toString()?.trim('"') ?: "",
+                byDeviceName = obj["byDeviceName"]?.toString()?.trim('"') ?: "",
                 event = obj["event"]?.jsonObject ?: buildJsonObject { },
             )
             "publish.ok" -> ServerFrame.PublishOk(

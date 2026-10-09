@@ -328,11 +328,45 @@ type Invite struct {
 
 type InviteStore struct {
 	mu      sync.Mutex
+	path    string
 	invites map[string]*Invite
 }
 
-func NewInviteStore() *InviteStore {
-	return &InviteStore{invites: map[string]*Invite{}}
+// NewInviteStore 从磁盘加载配对码（invites.json），不存在则新建空表。
+// 配对码持久化：服务端重启后仍可继续用旧码配对，避免"永久码"因重启失效。
+func NewInviteStore(path string) (*InviteStore, error) {
+	is := &InviteStore{path: path, invites: map[string]*Invite{}}
+	b, err := os.ReadFile(path)
+	if err == nil {
+		var raw map[string]*Invite
+		if e := json.Unmarshal(b, &raw); e != nil {
+			return nil, fmt.Errorf("配对码文件损坏: %w", e)
+		}
+		is.invites = raw
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	return is, nil
+}
+
+// saveLocked 将配对码写盘（调用方须持锁）。
+func (is *InviteStore) saveLocked() {
+	if is.path == "" {
+		return
+	}
+	b, err := json.MarshalIndent(is.invites, "", "  ")
+	if err != nil {
+		log.Printf("[warn] 序列化配对码失败: %v", err)
+		return
+	}
+	tmp := is.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		log.Printf("[warn] 写入配对码失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, is.path); err != nil {
+		log.Printf("[warn] 落盘配对码失败: %v", err)
+	}
 }
 
 // New 生成 8 位随机永久验证码（大写字母+数字，去掉易混淆的 0/1/I/O）。
@@ -350,6 +384,7 @@ func (is *InviteStore) New(createdBy string) (*Invite, error) {
 	}
 	inv := &Invite{Code: code, ExpiresAt: time.Now().Add(permanentTTL), CreatedBy: createdBy}
 	is.invites[code] = inv
+	is.saveLocked()
 	return inv, nil
 }
 
@@ -357,11 +392,16 @@ func (is *InviteStore) New(createdBy string) (*Invite, error) {
 func (is *InviteStore) RevokeByCreator(createdBy string) {
 	is.mu.Lock()
 	defer is.mu.Unlock()
+	changed := false
 	for _, inv := range is.invites {
 		if inv.CreatedBy == createdBy {
 			inv.Used = true
 			inv.ExpiresAt = time.Now().Add(-time.Second)
+			changed = true
 		}
+	}
+	if changed {
+		is.saveLocked()
 	}
 }
 
@@ -383,7 +423,7 @@ func (is *InviteStore) Take(code string) bool {
 	return true
 }
 
-// ListByCreator 某设备生成的全部码
+// ListByCreator 某设备生成的全部码（含已失效，用于变更验证码时踢出旧设备）
 func (is *InviteStore) ListByCreator(createdBy string) []*Invite {
 	is.mu.Lock()
 	defer is.mu.Unlock()
@@ -396,13 +436,32 @@ func (is *InviteStore) ListByCreator(createdBy string) []*Invite {
 	return out
 }
 
+// CurrentValid 返回某设备当前有效（未失效、未过期）的配对码；无则返回 nil。
+// 用于客户端"查询本机当前码"，保证显示码与服务端实际生效码一致。
+func (is *InviteStore) CurrentValid(createdBy string) *Invite {
+	is.mu.Lock()
+	defer is.mu.Unlock()
+	now := time.Now()
+	for _, inv := range is.invites {
+		if inv.CreatedBy == createdBy && !inv.Used && now.Before(inv.ExpiresAt) {
+			return inv
+		}
+	}
+	return nil
+}
+
 func (is *InviteStore) cleanupLocked() {
 	now := time.Now()
+	changed := false
 	for code, inv := range is.invites {
 		// 已失效/已过期 1 小时后清理
 		if inv.Used || now.After(inv.ExpiresAt.Add(time.Hour)) {
 			delete(is.invites, code)
+			changed = true
 		}
+	}
+	if changed {
+		is.saveLocked()
 	}
 }
 
@@ -443,7 +502,12 @@ func main() {
 	}
 	hub := NewHub(cfg)
 
-	srv := &Server{cfg: cfg, devices: devices, invites: NewInviteStore(), pending: NewPendingStore(),
+	invites, err := NewInviteStore(filepath.Join(cfg.DataDir, "invites.json"))
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+
+	srv := &Server{cfg: cfg, devices: devices, invites: invites, pending: NewPendingStore(),
 		joinGuard: NewJoinGuard(), admin: &AdminTokens{tokens: map[string]bool{}}, hub: hub}
 
 	mux := http.NewServeMux()

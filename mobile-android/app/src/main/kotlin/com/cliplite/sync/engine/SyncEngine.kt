@@ -21,6 +21,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -79,6 +81,12 @@ class SyncEngine(
     private val outbox = Channel<Pair<String, Protocol.ClipAdd>>(Channel.UNLIMITED)
     private val pendingAcks = ConcurrentHashMap<String, CompletableDeferred<Long>>()
 
+    // 串行化「读剪贴板 → 防重发判断 → publish → markSent」整条链路。
+    // 后台前台服务(每 2s 轮询) 与 onForeground(进前台) 会在不同协程并发调用
+    // uploadClipboardOnce；若不加锁，publish 挂起等 ack 期间 markSent 尚未执行，
+    // 另一个协程会再次读到同一剪贴板内容并重复 publish（表现为对端收到 2 条）。
+    private val uploadMutex = Mutex()
+
     // lastSeq 落盘防抖
     @Volatile private var lastSeqValue = 0L
     private var seqDirty = 0
@@ -124,52 +132,81 @@ class SyncEngine(
         try {
             if (!prefs.settings.first().upSync) return
             delay(600) // 等焦点稳定、剪贴板可读
-            val now = System.currentTimeMillis()
-            when (val c = bridge.read()) {
-                is ClipboardBridge.ClipboardContent.Text -> {
-                    val hash = Protocol.hash64(c.text.toByteArray(Charsets.UTF_8))
-                    // 防回环：若当前剪贴板内容正是某条「远端注入」的历史（autoCopy 写入），
-                    // 说明它来自对端，绝不再上行，避免 A→B→A 无限循环。
-                    val isRemoteEcho = clipDao.findByHash(hash)?.originRemote == true
-                    if (!isRemoteEcho && bridge.shouldSend(hash, now)) {
-                        val ev = Protocol.ClipAdd(
-                            syncId = UUID.randomUUID().toString(), clipType = 1, hash = Protocol.u64(hash),
-                            payloadB64 = ClipboardBridge.b64(c.text.toByteArray(Charsets.UTF_8)),
-                            ts = now.toString(),
-                        )
-                        if (publish(ev)) {
-                            bridge.markSent(hash, now)
-                            insertLocal(ev)
-                            events.tryEmit(EngineEvent.Toast("已同步本机剪贴板"))
-                        }
-                    }
-                }
-                is ClipboardBridge.ClipboardContent.Image -> {
-                    val hash = Protocol.hash64(c.bytes)
-                    val limitBytes = prefs.settings.first().sizeLimitMb * 1024L * 1024L
-                    val isRemoteEcho = clipDao.findByHash(hash)?.originRemote == true
-                    if (c.bytes.size > limitBytes) {
-                        events.tryEmit(EngineEvent.Toast("图片 ${c.bytes.size / 1048576}MB 超过上限，未发送"))
-                    } else if (!isRemoteEcho && bridge.shouldSend(hash, now)) {
-                        val ev = Protocol.ClipAdd(
-                            syncId = UUID.randomUUID().toString(),
-                            clipType = if (c.isPng) 3 else 3, // 3=Image（PNG/JPEG 原格式，解码端自适应）
-                            hash = Protocol.u64(hash),
-                            payloadB64 = ClipboardBridge.b64(c.bytes),
-                            ts = now.toString(),
-                        )
-                        if (publish(ev)) {
-                            bridge.markSent(hash, now)
-                            insertLocal(ev)
-                            events.tryEmit(EngineEvent.Toast("已同步剪贴板图片"))
-                        }
-                    }
-                }
-                ClipboardBridge.ClipboardContent.Empty -> Unit
-            }
+            uploadClipboardOnce()
         } catch (e: Exception) {
             // 前台剪贴板上行属尽力而为：任何异常都不能导致主线程 crash（lifecycleScope 会传播异常）
             AppLog.e("engine", "onForeground 上行异常: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    /**
+     * 读一次剪贴板并尝试上行（防重发/防回环）。
+     * 前台 onForeground 与后台前台服务轮询共用：后台服务周期性调用即可实现
+     * 「微信复制 → 自动同步 PC」，去重指纹 bridge.lastSentHash 保证同内容 5 分钟内不重发。
+     * 不 emit Toast（后台无 UI，且轮询高频会刷屏），仅返回是否成功上行。
+     */
+    suspend fun uploadClipboardOnce(): Boolean {
+        if (!prefs.settings.first().upSync) return false
+        val now = System.currentTimeMillis()
+        // 串行化：防止后台轮询与 onForeground 并发重入导致同一内容重复上行
+        return uploadMutex.withLock {
+            try {
+                when (val c = bridge.read()) {
+                    is ClipboardBridge.ClipboardContent.Text -> {
+                        val hash = Protocol.hash64(c.text.toByteArray(Charsets.UTF_8))
+                        // 防回环：若当前剪贴板内容正是某条「远端注入」的历史（autoCopy 写入），
+                        // 说明它来自对端，绝不再上行，避免 A→B→A 无限循环。
+                        // 用 hasRemoteEcho（只看 originRemote=true 的条目）而非 findByHash（按 ts 取最新，
+                        // 会被本机同 hash 的旧条目干扰，导致远端注入内容被误判为本机复制而重复上行）。
+                        val isRemoteEcho = clipDao.hasRemoteEcho(hash) > 0
+                        if (!isRemoteEcho && bridge.shouldSend(hash, now)) {
+                            val ev = Protocol.ClipAdd(
+                                syncId = UUID.randomUUID().toString(), clipType = 1, hash = Protocol.u64(hash),
+                                payloadB64 = ClipboardBridge.b64(c.text.toByteArray(Charsets.UTF_8)),
+                                ts = now.toString(),
+                            )
+                            // 乐观标记：在 publish 前就 markSent，避免 publish 挂起等 ack 期间
+                            // 其他协程读到同一内容重复上行；失败则回滚，允许下次重试。
+                            bridge.markSent(hash, now)
+                            if (publish(ev)) {
+                                insertLocal(ev)
+                                true
+                            } else {
+                                bridge.rollbackSent()
+                                false
+                            }
+                        } else false
+                    }
+                    is ClipboardBridge.ClipboardContent.Image -> {
+                        val hash = Protocol.hash64(c.bytes)
+                        val limitBytes = prefs.settings.first().sizeLimitMb * 1024L * 1024L
+                        val isRemoteEcho = clipDao.hasRemoteEcho(hash) > 0
+                        if (c.bytes.size > limitBytes) {
+                            false
+                        } else if (!isRemoteEcho && bridge.shouldSend(hash, now)) {
+                            val ev = Protocol.ClipAdd(
+                                syncId = UUID.randomUUID().toString(),
+                                clipType = 3, // 3=Image（PNG/JPEG 原格式，解码端自适应）
+                                hash = Protocol.u64(hash),
+                                payloadB64 = ClipboardBridge.b64(c.bytes),
+                                ts = now.toString(),
+                            )
+                            bridge.markSent(hash, now)
+                            if (publish(ev)) {
+                                insertLocal(ev)
+                                true
+                            } else {
+                                bridge.rollbackSent()
+                                false
+                            }
+                        } else false
+                    }
+                    ClipboardBridge.ClipboardContent.Empty -> false
+                }
+            } catch (e: Exception) {
+                AppLog.e("engine", "uploadClipboardOnce 异常: ${e.javaClass.simpleName}: ${e.message}")
+                false
+            }
         }
     }
 
@@ -312,7 +349,7 @@ class SyncEngine(
                 } else if (f.byDevice != selfDeviceId && dedupDao.count(ev.syncId) == 0) {
                     AppLog.i("engine", "收到 clip.add seq=${f.seq} type=${ev.clipType} from=${f.byDevice}")
                     dedupDao.insert(DedupEntity(ev.syncId, f.seq, System.currentTimeMillis()))
-                    insertRemote(ev, f.byDevice)
+                    insertRemote(ev, f.byDevice, f.byDeviceName)
                 }
             }
             "clip.pin" -> {
@@ -328,25 +365,19 @@ class SyncEngine(
         advanceSeq(f.seq)
     }
 
-    private suspend fun insertRemote(ev: Protocol.ClipAdd, byDevice: String) {
+    private suspend fun insertRemote(ev: Protocol.ClipAdd, byDevice: String, byDeviceName: String) {
         val s = prefs.settings.first()
         if (!s.downSync) return
-        val entity = buildEntity(ev, seq = 0, byDevice, remote = true) ?: return
+        // 来源展示：优先用对端设备名（服务端广播携带），缺失回退到设备 ID
+        val origin = byDeviceName.ifBlank { byDevice }
+        val entity = buildEntity(ev, seq = 0, origin, remote = true) ?: return
         clipDao.upsert(entity)
         trimHistory(s.historyCap)
-        // 自动写剪贴板：最新条目（按 seq 顺序应用，最后一条即最新）
-        if (s.autoCopy && !ev.localOnly) {
-            when (ev.clipType) {
-                1, 5 -> ev.payloadB64?.let { p ->
-                    val text = String(ClipboardBridge.unb64(p), Charsets.UTF_8)
-                    if (bridge.writeText(text)) {
-                        bridge.markSent(ev.hashLong, System.currentTimeMillis()) // 防回环
-                        events.tryEmit(EngineEvent.Toast("已写入剪贴板：${text.take(24)}…"))
-                    }
-                }
-                // 图片写入系统剪贴板需 content uri（M2 接 FileProvider），M1 先入历史
-            }
-        }
+        // 不再自动写回系统剪贴板：远端内容只入历史展示。
+        // 若写回，后台轮询/剪贴板监听会再次读到同一内容（originRemote 记录尚未落库的
+        // 竞态窗口内 hasRemoteEcho 查不到），被判为「本机新复制」而重复入库，
+        // 导致一条 PC 复制在移动端出现「来源PC + 来源自己」两条记录。
+        // 用户如需使用，点击条目手动复制即可。
     }
 
     private suspend fun insertLocal(ev: Protocol.ClipAdd) {

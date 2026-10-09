@@ -148,6 +148,7 @@ void SyncManager::connectionLoop() {
         if (connected && sessionOk) {
             backoffSeconds = 1;
             setState(SyncState::Online);
+            lastInboundMs_.store(unixNowMs()); // 看门狗起点
             // 读循环：收到帧交给 handleServerFrame；服务端静默/断开则退出重连
             while (running_.load()) {
                 std::string text;
@@ -155,6 +156,7 @@ void SyncManager::connectionLoop() {
                 if (!receiveFrame(text, closed) || closed) break;
                 if (!text.empty()) handleServerFrame(text);
             }
+            log("read loop exited（读循环结束）");
         }
         closeSocket();
         if (!running_.load()) break;
@@ -183,6 +185,22 @@ void SyncManager::senderLoop() {
             }
         }
         if (sendPing) {
+            // 看门狗：在线状态下超过 150s（服务端 120s 空闲上限的余量）没有收到任何
+            // 下行帧（pong/事件），判定连接假活（服务端写路径死亡、本端 receive 无限阻塞），
+            // 强制关闭 socket 让阻塞的 receiveFrame 立即返回错误 → 读循环退出 → 重连。
+            const std::int64_t last = lastInboundMs_.load();
+            if (last != 0) {
+                const std::int64_t now = unixNowMs();
+                if (now - last > 150000) {
+                    log("watchdog: 150s 未收到任何下行帧，判定连接假活，强制重连");
+                    void* sock = socket_;
+                    if (sock) {
+                        WinHttpWebSocketClose(static_cast<HINTERNET>(sock),
+                                              WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
+                    }
+                    continue;
+                }
+            }
             sendFrameText("{\"v\":1,\"type\":\"ping\"}");
             continue;
         }
@@ -334,7 +352,11 @@ bool SyncManager::receiveFrame(std::string& text, bool& closed) {
     for (;;) {
         DWORD err = WinHttpWebSocketReceive(static_cast<HINTERNET>(sock), chunk, sizeof(chunk),
                                             &done, &type);
-        if (err != NO_ERROR) return false;
+        if (err != NO_ERROR) {
+            log(("receiveFrame: WinHttpWebSocketReceive error " + std::to_string(err)).c_str());
+            return false;
+        }
+        lastInboundMs_.store(unixNowMs()); // 任何下行帧（含 pong）都算活着
         switch (type) {
         case WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE:
         case WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE:
@@ -395,8 +417,12 @@ bool SyncManager::sendHelloAndConsumeAck() {
 
 void SyncManager::handleServerFrame(const std::string& text) {
     JValue f;
-    if (!parseJson(text, f) || !f.isObject()) return;
+    if (!parseJson(text, f) || !f.isObject()) {
+        log("ws frame: 解析失败（非 JSON 对象）");
+        return;
+    }
     const std::string type = f.at("type").asString();
+    log(("ws frame: type=" + type).c_str());
     if (type == "event") {
         applyRemoteEvent(f.at("byDevice").asString(), text);
     } else if (type == "publish.ok") {
@@ -414,24 +440,36 @@ void SyncManager::handleServerFrame(const std::string& text) {
 }
 
 void SyncManager::applyRemoteEvent(const std::string& byDevice, const std::string& frameText) {
+    const std::string selfId(config_.deviceId.begin(), config_.deviceId.end());
     // 自己广播的事件：服务端已不回发；补发窗口内可能出现，跳过
-    if (!config_.deviceId.empty() &&
-        byDevice == std::string(config_.deviceId.begin(), config_.deviceId.end())) {
+    if (!config_.deviceId.empty() && byDevice == selfId) {
+        log(("applyRemoteEvent: skip self event (byDevice=" + byDevice + ")").c_str());
         return;
     }
 
     // 帧内 event 节点
     JValue f;
-    if (!parseJson(frameText, f) || !f.isObject()) return;
+    if (!parseJson(frameText, f) || !f.isObject()) {
+        log("applyRemoteEvent: json parse failed");
+        return;
+    }
     const JValue& ev = f.at("event");
-    if (!ev.isObject()) return;
+    if (!ev.isObject()) {
+        log("applyRemoteEvent: event node not object");
+        return;
+    }
 
     const std::int64_t seq = f.at("seq").asInt();
     SyncEvent e;
+    e.byDeviceName = f.at("byDeviceName").asString(); // 顶层字段：发布者设备名
     e.kind = ev.at("kind").asString();
     e.syncId = ev.at("syncId").asString();
-    if (e.kind.empty() || e.syncId.empty()) return;
+    if (e.kind.empty() || e.syncId.empty()) {
+        log("applyRemoteEvent: kind/syncId empty");
+        return;
+    }
     if (seenSyncId(e.syncId)) { // 已处理过（补发重复）
+        log(("applyRemoteEvent: dup syncId=" + e.syncId).c_str());
         std::lock_guard<std::mutex> lock(seqMutex_);
         if (seq > lastSeq_) {
             lastSeq_ = seq;
@@ -439,6 +477,8 @@ void SyncManager::applyRemoteEvent(const std::string& byDevice, const std::strin
         }
         return;
     }
+    log(("applyRemoteEvent: accept kind=" + e.kind + " byDevice=" + byDevice +
+         " byDeviceName=" + e.byDeviceName + " syncId=" + e.syncId).c_str());
 
     if (e.kind == "clip.add") {
         e.clipType = static_cast<int>(ev.at("clipType").asInt(1));
@@ -448,15 +488,33 @@ void SyncManager::applyRemoteEvent(const std::string& byDevice, const std::strin
         e.ts = static_cast<std::uint64_t>(ev.at("ts").asInt());
         if (!e.localOnly) {
             const std::string b64 = ev.at("payloadB64").asString();
-            if (!b64.empty() && !base64Decode(b64, e.payload)) return;
+            if (b64.empty()) {
+                log("applyRemoteEvent: payloadB64 empty");
+                return;
+            }
+            if (!base64Decode(b64, e.payload)) {
+                log(("applyRemoteEvent: base64 decode failed, len=" + std::to_string(b64.size())).c_str());
+                return;
+            }
             if (ev.has("bundle")) {
                 const JValue& bundle = ev.at("bundle");
-                if (!bundle.isObject()) return;
-                e.bundleFileCount = static_cast<int>(bundle.at("fileCount").asInt(0));
-                e.bundleTotalBytes =
-                    static_cast<std::uint64_t>(bundle.at("totalBytes").asInt(0));
-                const std::string bundleB64 = bundle.at("payloadB64").asString();
-                if (bundleB64.empty() || !base64Decode(bundleB64, e.bundleZip)) return;
+                // 移动端 ClipAdd.bundle 默认 null 且会序列化成 "bundle": null；
+                // null 等价于"无文件清单"，不能当作解析失败丢弃事件。
+                if (bundle.isNull()) {
+                    // 无 bundle，正常继续
+                } else if (!bundle.isObject()) {
+                    log("applyRemoteEvent: bundle not object");
+                    return;
+                } else {
+                    e.bundleFileCount = static_cast<int>(bundle.at("fileCount").asInt(0));
+                    e.bundleTotalBytes =
+                        static_cast<std::uint64_t>(bundle.at("totalBytes").asInt(0));
+                    const std::string bundleB64 = bundle.at("payloadB64").asString();
+                    if (bundleB64.empty() || !base64Decode(bundleB64, e.bundleZip)) {
+                        log("applyRemoteEvent: bundle base64 decode failed");
+                        return;
+                    }
+                }
             }
         }
         if (remoteHandler_) remoteHandler_(e); // 宿主负责 hash 查重 + ClipStore 注入
@@ -632,6 +690,33 @@ bool SyncManager::DeviceInvite(const std::wstring& serverUrl, const std::string&
     int status = 0;
     std::string response;
     if (!restCall(serverUrl, L"POST", L"/v1/device/invite", body, deviceToken,
+                  status, response, errorUtf8)) {
+        return false;
+    }
+    JValue json;
+    if (!parseJson(response, json) || !json.isObject()) {
+        errorUtf8 = "服务端响应解析失败";
+        return false;
+    }
+    if (status != 200) {
+        errorUtf8 = errorFromResponse(status, response);
+        return false;
+    }
+    code = json.at("code").asString();
+    expiresAtMs = json.at("expiresAt").asInt();
+    if (code.empty()) {
+        errorUtf8 = "服务端响应缺少字段";
+        return false;
+    }
+    return true;
+}
+
+bool SyncManager::DeviceInviteGet(const std::wstring& serverUrl, const std::string& deviceToken,
+                                  std::string& code, std::int64_t& expiresAtMs,
+                                  std::string& errorUtf8) {
+    int status = 0;
+    std::string response;
+    if (!restCall(serverUrl, L"GET", L"/v1/device/invite", std::string(), deviceToken,
                   status, response, errorUtf8)) {
         return false;
     }

@@ -194,9 +194,41 @@ func (s *Server) authDevice(r *http.Request) *Device {
 
 // ---------- REST：设备侧配对 ----------
 
+// GET /v1/device/invite —— 查询本机当前有效配对码（无则自动生成一个并返回）。
+// 用于客户端重启后恢复显示配对码，保证"展示的码"与服务端实际生效码一致。
+func (s *Server) handleDeviceInviteGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respond(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+	device := s.authDevice(r)
+	if device == nil {
+		respond(w, 401, map[string]string{"error": "本机配对已失效，请重新配对（在客户端点「生成配对码」或填码「加入」）"})
+		return
+	}
+	inv := s.invites.CurrentValid(device.ID)
+	if inv == nil {
+		var err error
+		inv, err = s.invites.New(device.ID)
+		if err != nil {
+			respond(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		log.Printf("[pair] 设备 %s(%s) 查询配对码时自动补发 %s", device.Name, device.ID, inv.Code)
+	}
+	respond(w, 200, map[string]any{
+		"code":      inv.Code,
+		"expiresAt": inv.ExpiresAt.UnixMilli(),
+	})
+}
+
 // POST /v1/device/invite —— 已配对设备生成永久验证码（8 位随机，可重复使用）。
 // 请求体可选 {"rotate":true}：变更验证码时传 true，会先撤销旧码并踢出旧码加入的全部设备。
 func (s *Server) handleDeviceInvite(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		s.handleDeviceInviteGet(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		respond(w, 405, map[string]string{"error": "method not allowed"})
 		return

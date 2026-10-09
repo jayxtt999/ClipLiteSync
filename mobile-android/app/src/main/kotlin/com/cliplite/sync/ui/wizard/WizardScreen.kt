@@ -47,6 +47,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.cliplite.sync.AppContainer
+import com.cliplite.sync.ClipSyncService
 import com.cliplite.sync.engine.AppLog
 import com.cliplite.sync.engine.RestApi
 import com.cliplite.sync.ui.ButtonFull
@@ -105,6 +106,7 @@ class WizardViewModel(private val container: AppContainer) : ViewModel() {
                 val inv = api.invite(reg.deviceToken)
                 inviteSheet = inv
                 container.engine.start()
+                ClipSyncService.start(container.appContext)
             } catch (e: Exception) {
                 AppLog.e("wizard", "createGroup 失败: ${e.javaClass.simpleName}: ${e.message}")
                 error = e.message ?: "注册失败，请检查服务器地址"
@@ -128,6 +130,7 @@ class WizardViewModel(private val container: AppContainer) : ViewModel() {
                         container.prefs.savePairing(
                             addr, resp.deviceId!!, resp.deviceToken!!, deviceName)
                         container.engine.start()
+                        ClipSyncService.start(container.appContext)
                         onResult(true, "已加入同步组，开始同步")
                     }
                     "pending" -> {
@@ -156,6 +159,7 @@ class WizardViewModel(private val container: AppContainer) : ViewModel() {
                             AppLog.i("wizard", "join approved deviceId=${st.deviceId}")
                             container.prefs.savePairing(addr, st.deviceId!!, st.deviceToken!!, deviceName)
                             container.engine.start()
+                            ClipSyncService.start(container.appContext)
                             joining = false
                             onResult(true, "对方已确认，开始同步")
                             return@launch

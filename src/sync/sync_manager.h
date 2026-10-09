@@ -47,6 +47,7 @@ struct SyncEvent {
     bool pinned = false;    // kind=clip.pin 时的置顶状态
     std::string sourceApp;
     std::uint64_t ts = 0;   // Unix 毫秒
+    std::string byDeviceName; // 发布者设备名（服务端广播携带，用于历史来源展示）
 };
 
 enum class SyncState { Stopped, Connecting, Online, Offline };
@@ -108,6 +109,12 @@ public:
     static bool DeviceInvite(const std::wstring& serverUrl, const std::string& deviceToken,
                              std::string& code, std::int64_t& expiresAtMs, std::string& errorUtf8,
                              bool rotate = false);
+
+    // 查询本机当前有效配对码（服务端无有效码时自动生成一个并返回）。
+    // 用于客户端重启后恢复显示配对码，保证"展示的码"与服务端实际生效码一致。
+    static bool DeviceInviteGet(const std::wstring& serverUrl, const std::string& deviceToken,
+                                std::string& code, std::int64_t& expiresAtMs,
+                                std::string& errorUtf8);
 
     // 开放注册：本机未配对时直接向服务端注册，自成一个新房间（无需管理员创始码）。
     // 成功返回 true 并填 deviceId/deviceToken；服务端可用 CLIPSYNC_DISABLE_REGISTER=1 关闭。
@@ -199,6 +206,10 @@ private:
 
     std::mutex seqMutex_;
     std::atomic<std::int64_t> lastSeq_{0}; // 读侧无锁（UI 线程轮询状态）
+
+    // 看门狗：最近一次收到任何下行帧（含 pong）的单调毫秒时间戳。
+    // 防止"假活连接"：服务端写路径死亡时客户端 receive 无限阻塞、永不重连。
+    std::atomic<std::int64_t> lastInboundMs_{0};
 
     std::mutex seenMutex_;
     std::deque<std::string> seenIds_; // FIFO 去重表（容量 512）

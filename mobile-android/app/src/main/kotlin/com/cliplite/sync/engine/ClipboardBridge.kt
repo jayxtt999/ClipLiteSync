@@ -92,6 +92,9 @@ class ClipboardBridge(private val context: Context) {
 
     fun markSent(hash: Long, now: Long) { lastSentHash = hash; lastSentAt = now }
 
+    /** 上行失败时回滚 lastSent，允许同一内容在后续轮询里重试 */
+    fun rollbackSent() { lastSentHash = 0; lastSentAt = 0 }
+
     companion object {
         /** 图片解码：上限 4096px，超限降采样（OOM 对策） */
         fun decodeBitmap(bytes: ByteArray, maxDim: Int = 4096): Bitmap? {

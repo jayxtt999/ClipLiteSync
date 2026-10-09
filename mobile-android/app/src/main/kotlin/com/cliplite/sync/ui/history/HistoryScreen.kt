@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
@@ -117,6 +118,14 @@ fun HistoryScreen(container: AppContainer, conn: SyncEngine.ConnState, snackbar:
         else clips.filter { it.textContent?.contains(vm.query, ignoreCase = true) == true }
     }
 
+    // 列表滚动状态：进入页面或列表刷新时自动定位到最顶部（最新一条）
+    val listState = rememberLazyListState()
+    LaunchedEffect(clips.size, filtered.size) {
+        if (filtered.isNotEmpty() && listState.firstVisibleItemIndex != 0) {
+            listState.scrollToItem(0)
+        }
+    }
+
     fun copyText(clip: ClipEntity) {
         scope.launch {
             val ok = container.engine.copyToClipboard(clip.syncId)
@@ -165,6 +174,7 @@ fun HistoryScreen(container: AppContainer, conn: SyncEngine.ConnState, snackbar:
 
         LazyColumn(
             Modifier.fillMaxSize(),
+            state = listState,
             contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 18.dp, end = 18.dp, bottom = 18.dp),
         ) {
             items(filtered, key = { it.syncId }) { clip ->

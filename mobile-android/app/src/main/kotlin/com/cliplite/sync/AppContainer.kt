@@ -8,6 +8,7 @@ import com.cliplite.sync.engine.SyncEngine
 
 /** 手写单例容器（项目规模不需要 Hilt） */
 class AppContainer(context: Context) {
+    val appContext: Context = context.applicationContext
     val prefs = Prefs(context)
     val db: AppDatabase = Room.databaseBuilder(context, AppDatabase::class.java, "clipsync.db")
         .fallbackToDestructiveMigration()

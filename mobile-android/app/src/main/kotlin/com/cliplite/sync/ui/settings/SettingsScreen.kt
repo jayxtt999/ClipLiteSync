@@ -39,6 +39,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.cliplite.sync.AppContainer
+import com.cliplite.sync.ClipSyncService
 import com.cliplite.sync.data.Prefs
 import com.cliplite.sync.ui.ConfirmDialog
 import com.cliplite.sync.ui.wizard.Hint
@@ -99,7 +100,10 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun exitGroup() {
-        viewModelScope.launch { container.engine.unpair() }
+        viewModelScope.launch {
+            ClipSyncService.stop(container.appContext)
+            container.engine.unpair()
+        }
     }
 
     fun clearHistory() {

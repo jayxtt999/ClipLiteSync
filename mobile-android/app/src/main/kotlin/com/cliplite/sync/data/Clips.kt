@@ -48,6 +48,10 @@ interface ClipDao {
     @Query("SELECT * FROM clips WHERE hash = :hash ORDER BY ts DESC LIMIT 1")
     suspend fun findByHash(hash: Long): ClipEntity?
 
+    /** 是否存在「远端注入」的同 hash 条目（防回环：只看 originRemote，不受本机同 hash 条目干扰） */
+    @Query("SELECT COUNT(*) FROM clips WHERE hash = :hash AND originRemote = 1")
+    suspend fun hasRemoteEcho(hash: Long): Int
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(clip: ClipEntity)
 

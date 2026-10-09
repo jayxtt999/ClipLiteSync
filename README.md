@@ -6,7 +6,7 @@
 
 [English](README.en.md) · [使用说明](USAGE.md) · [同步操作指南](docs/sync-user-guide.md) · [同步协议](docs/clip-sync-protocol.md) · [更新日志](CHANGELOG.md)
 
-当前版本：**2.0.1**
+当前版本：**2.1.0**
 
 ---
 

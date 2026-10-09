@@ -14,10 +14,11 @@ import (
 // ---------- 事件与环形缓冲 ----------
 
 type Event struct {
-	Seq      int64           `json:"seq"`
-	ByDevice string          `json:"byDevice"`
-	Room     string          `json:"room,omitempty"` // 房间根设备 ID：只投递给同房间设备
-	Event    json.RawMessage `json:"event"`
+	Seq          int64           `json:"seq"`
+	ByDevice     string          `json:"byDevice"`
+	ByDeviceName string          `json:"byDeviceName"` // 发布者设备名（客户端直接展示，免映射）
+	Room         string          `json:"room,omitempty"` // 房间根设备 ID：只投递给同房间设备
+	Event        json.RawMessage `json:"event"`
 }
 
 type RingBuffer struct {
@@ -99,6 +100,14 @@ func writeLoop(c *conn) {
 	for b := range c.send {
 		c.ws.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if err := c.ws.WriteMessage(websocket.TextMessage, b); err != nil {
+			// 写失败必须把连接整个杀掉：否则读循环还在（客户端 ping 保活），
+			// 连接变成"假活"——收不到任何下行帧，客户端也永不重连。
+			name, id := "<nil>", "<nil>"
+			if c.device != nil {
+				name, id = c.device.Name, c.device.ID
+			}
+			log.Printf("[warn] writeLoop 写失败 (%s %s): %v — 关闭连接触发客户端重连", name, id, err)
+			c.ws.Close() // 让 handleWS 的 ReadJSON 立即出错 → defer drop 回收
 			return
 		}
 	}
@@ -155,7 +164,7 @@ func (h *Hub) KickDevice(deviceID string) int {
 }
 
 func (h *Hub) broadcast(e *Event, except *conn) {
-	b, _ := json.Marshal(map[string]any{"v": 1, "type": "event", "seq": e.Seq, "byDevice": e.ByDevice, "event": e.Event})
+	b, _ := json.Marshal(map[string]any{"v": 1, "type": "event", "seq": e.Seq, "byDevice": e.ByDevice, "byDeviceName": e.ByDeviceName, "event": e.Event})
 	h.mu.Lock()
 	targets := make([]*conn, 0, len(h.conns))
 	for c := range h.conns {
@@ -175,12 +184,21 @@ func (h *Hub) broadcast(e *Event, except *conn) {
 			h.drop(c)
 		}
 	}
+	if len(targets) > 0 {
+		ids := make([]string, 0, len(targets))
+		for _, c := range targets {
+			ids = append(ids, c.device.ID)
+		}
+		log.Printf("[sync] broadcast seq=%d room=%s by=%s -> [%s]", e.Seq, e.Room, e.ByDevice, strings.Join(ids, ","))
+	} else {
+		log.Printf("[sync] broadcast seq=%d room=%s by=%s -> 无目标（房间过滤后为空）", e.Seq, e.Room, e.ByDevice)
+	}
 }
 
 func (h *Hub) publish(device *Device, raw json.RawMessage) *Event {
 	h.mu.Lock()
 	h.seq++
-	e := &Event{Seq: h.seq, ByDevice: device.ID, Room: device.RoomID, Event: raw}
+	e := &Event{Seq: h.seq, ByDevice: device.ID, ByDeviceName: device.Name, Room: device.RoomID, Event: raw}
 	h.rb.Append(e)
 	h.mu.Unlock()
 	return e
@@ -254,7 +272,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	replay := s.hub.rb.Replay(hello.LastSeq, device.RoomID)
 	c.enqueueJSON(map[string]any{"v": 1, "type": "hello.ok", "seq": s.hub.LatestSeq(), "replayed": len(replay)})
 	for _, e := range replay {
-		b, _ := json.Marshal(map[string]any{"v": 1, "type": "event", "seq": e.Seq, "byDevice": e.ByDevice, "event": e.Event})
+		b, _ := json.Marshal(map[string]any{"v": 1, "type": "event", "seq": e.Seq, "byDevice": e.ByDevice, "byDeviceName": e.ByDeviceName, "event": e.Event})
 		c.enqueue(b)
 	}
 	log.Printf("[sync] 设备 %s(%s) 已连接，补发 %d 条", device.Name, device.ID, len(replay))
@@ -278,6 +296,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 					c.enqueueJSON(map[string]any{"v": 1, "type": "error", "code": "too_big", "detail": "事件超过上限"})
 					continue
 				}
+				log.Printf("[sync] publish 收到: from=%s(%s) room=%s len=%d", device.Name, device.ID, device.RoomID, len(ev))
 				e := s.hub.publish(device, ev)
 				c.enqueueJSON(map[string]any{"v": 1, "type": "publish.ok", "clientEventId": f.ClientEventID, "seq": e.Seq})
 				s.hub.broadcast(e, c)

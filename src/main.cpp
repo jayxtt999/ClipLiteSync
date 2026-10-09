@@ -198,6 +198,7 @@ constexpr UINT kPastePayloadLoadedMessage = WM_APP + 16;
 constexpr UINT kUpdateCheckCompleteMessage = WM_APP + 17;
 constexpr UINT kSyncPairResultMessage = WM_APP + 18;
 constexpr UINT kSyncGenCodeResultMessage = WM_APP + 19;   // 配对码生成结果
+constexpr UINT kSyncGenFetchResultMessage = WM_APP + 24;  // 配对码自动拉取结果
 constexpr UINT kSyncJoinPollResultMessage = WM_APP + 20;  // 加入申请轮询结果
 constexpr UINT kSyncPendingResultMessage = WM_APP + 21;   // 待确认列表刷新
 constexpr UINT kSyncPeersResultMessage = WM_APP + 22;     // 房间成员列表刷新 / 移除结果
@@ -309,7 +310,7 @@ constexpr int kSupportQqWidth = 560;
 constexpr int kSupportQqHeight = 700;
 constexpr std::size_t kPopupImagePreviewCacheLimit = 24;
 constexpr std::size_t kPopupSourceIconCacheLimit = 32;
-constexpr char kCurrentVersion[] = "2.0.1";
+constexpr char kCurrentVersion[] = "2.1.0";
 constexpr wchar_t kSourceUrl[] = L"https://github.com/wxh-777/ClipLite";
 constexpr wchar_t kLatestReleaseApiUrl[] =
     L"https://api.github.com/repos/wxh-777/ClipLite/releases/latest";
@@ -647,6 +648,7 @@ struct AppState {
     std::string syncGenCode;             // 房主：最近生成的验证码
     std::string syncGenError;
     bool syncGenRotate = false;          // 房主：本次是否为变更验证码（撤销旧码踢旧设备）
+    bool syncGenFetching = false;        // 自动拉取当前码进行中（防并发，重启后恢复显示用）
     bool syncCodeHidden = true;          // 验证码展示框是否隐藏（眼睛图标状态）
     std::string syncJoinRequestId;       // 加入方：待确认申请 ID（空=无）
     bool syncJoinPollBusy = false;       // 加入方：轮询进行中
@@ -1320,7 +1322,7 @@ const SettingsLocale kEnglishSettingsLocale{
      L"Some shortcuts could not be registered. Choose different combinations.",
     L"Custom shortcuts require at least one modifier key.",
     L"Sensitive markers: password, token, api_key, secret, and private keys; detected by content pattern.",
-        L"Application    ClipLiteSync", L"Version        2.0.1 x64", L"Storage format  v4",
+        L"Application    ClipLiteSync", L"Version        2.1.0 x64", L"Storage format  v4",
      L"Data directory  %LOCALAPPDATA%\\ClipLite", L"Browse", L"Clear unpinned history", L"Clear unpinned text",
      L"Clear unpinned images", L"Clear unpinned files", L"Press shortcut", L"Need modifier", L"One application per line", L"Auto",
     L"ClipLiteSync Settings", L"Choose a valid cache directory.", L"Unable to create the cache directory.",
@@ -1371,7 +1373,7 @@ const SettingsLocale kChineseSettingsLocale{
      L"无法注册“%ls”（%ls），可能已被其他程序或 Windows 占用，已恢复为 %ls。",
      L"部分快捷键注册失败，请更换组合键。", L"自定义快捷键至少需要一个修饰键。",
     L"敏感标记：password、token、api_key、secret 和私钥；按内容格式检测。",
-          L"应用名称    ClipLiteSync", L"版本        2.0.1 x64", L"存储格式    v4",
+          L"应用名称    ClipLiteSync", L"版本        2.1.0 x64", L"存储格式    v4",
      L"数据目录    %LOCALAPPDATA%\\ClipLite", L"浏览", L"清理未置顶历史", L"清理未置顶文本", L"清理未置顶图片",
       L"清理未置顶文件", L"按下组合键", L"需要修饰键", L"每行一个应用名称", L"自动", L"ClipLiteSync 设置",
     L"请选择有效的缓存目录。", L"无法创建缓存目录。", L"目标目录已有历史数据，请选择空目录。",
@@ -2061,6 +2063,69 @@ void handleSyncGenCodeResult(HWND hwnd) {
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
+// 自动拉取本机当前有效配对码（服务端无则自动生成并返回）。
+// 用于重启后恢复显示配对码，保证"展示的码"与服务端实际生效码一致。
+void requestSyncCodeFetch(HWND hwnd) {
+    if (!g_app || !hwnd) return;
+    std::string server;
+    std::string token;
+    bool codeEmpty = false;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        if (g_app->syncGenBusy || g_app->syncGenFetching) return;
+        server = g_app->settingsData.syncServer;
+        token = g_app->settingsData.syncToken;
+        codeEmpty = g_app->syncGenCode.empty();
+    }
+    if (server.empty() || token.empty()) return;
+    if (!codeEmpty) return; // 已有码则无需拉取（生成/变更后已填充）
+    const HWND settingsWindow = hwnd;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        g_app->syncGenFetching = true;
+    }
+    std::thread([settingsWindow, server, token] {
+        using clipsync::SyncManager;
+        std::string code;
+        std::int64_t expiresAt = 0;
+        std::string error;
+        const bool ok = SyncManager::DeviceInviteGet(utf8ToWide(server), token, code,
+                                                     expiresAt, error);
+        if (g_app) {
+            std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+            g_app->syncGenFetching = false;
+            if (ok && !code.empty()) {
+                g_app->syncGenCode = code;
+            }
+        }
+        PostMessageW(settingsWindow, kSyncGenFetchResultMessage, ok ? 1 : 0, 0);
+    }).detach();
+}
+
+// 配对码自动拉取结果（kSyncGenFetchResultMessage，UI 线程）
+void handleSyncCodeFetchResult(HWND hwnd, bool ok) {
+    if (!g_app || !hwnd) return;
+    std::string code;
+    {
+        std::lock_guard<std::mutex> lock(g_app->syncPairMutex);
+        code = g_app->syncGenCode;
+    }
+    if (!ok) {
+        // 拉取失败（服务端不可达等）静默，等待下次轮询重试
+        return;
+    }
+    if (HWND box = settingsControl(hwnd, kSettingSyncCodeBox)) {
+        const std::wstring codeW = utf8ToWide(code);
+        SetWindowTextW(box, g_app->syncCodeHidden
+            ? std::wstring(codeW.size(), L'●').c_str() : codeW.c_str());
+    }
+    if (HWND eye = settingsControl(hwnd, kSettingSyncCodeEye)) {
+        SetWindowTextW(eye, tr(g_app->syncCodeHidden ? L"Show" : L"Hide",
+                               g_app->syncCodeHidden ? L"显示" : L"隐藏"));
+    }
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
 // 眼睛图标：切换验证码显示/隐藏
 void toggleSyncCodeVisibility(HWND hwnd) {
     if (!g_app || !hwnd) return;
@@ -2454,6 +2519,9 @@ void syncPollTickOnce(HWND hwnd) {
         return;
     }
     if (!token.empty()) {
+        // 房主：若本机尚无配对码（重启后内存态丢失），自动向服务端拉取当前有效码。
+        // 注意：requestSyncCodeFetch 内部自行加锁并做防并发判断，此处不能再持锁调用（否则死锁）。
+        requestSyncCodeFetch(hwnd);
         // 房主：刷新待确认申请列表
         bool pendingBusy = false;
         {
@@ -14193,6 +14261,10 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             handleSyncGenCodeResult(hwnd);
             return 0;
         }
+        if (message == kSyncGenFetchResultMessage) {
+            handleSyncCodeFetchResult(hwnd, wParam != 0);
+            return 0;
+        }
         if (message == kSyncJoinPollResultMessage) {
             handleSyncJoinPollResult(hwnd);
             return 0;
@@ -15706,7 +15778,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
                 const std::uint64_t hash = clipboardDedupHash(type, payload);
                 appendDiagnosticLog("INFO", "sync: clip.add hash computed");
                 if (g_app->store.findHash(hash) != g_app->store.activeCount()) return; // 已存在，去重
-                if (g_app->store.appendOrUpdate(type, payload, hash, "clip-sync")) {
+                // 来源展示：优先用对端设备名（服务端广播携带），缺失时回退 sourceApp/固定标记
+                std::string src = event.byDeviceName;
+                if (src.empty()) src = event.sourceApp;
+                if (src.empty()) src = "clip-sync";
+                if (g_app->store.appendOrUpdate(type, payload, hash, src)) {
                     appendDiagnosticLog("INFO", "sync: remote clip appended");
                     PostMessageW(g_app->hidden, kStoreChangedMessage, 0, 0);
                 } else {
